@@ -136,13 +136,13 @@ test.describe('手机 375px', () => {
       const inGameRecords = await expectRecordsLayoutSane(host);
       expect(inGameRecords).toBe(1);
 
-      // —— M02：房间四个次操作（邀请亲友/规则/提前结束/离开房间）文案不拆字、点击区 ≥44px ——
+      // —— M02：房间五个次操作（音效/邀请亲友/规则/提前结束/离开房间）文案不拆字、点击区 ≥44px ——
       // 先切回玩家 Tab：几何断言依赖面板真的可见（隐藏元素的矩形是 0）
       await host.getByRole('tab', { name: '玩家' }).click();
       await expect(host.locator('.player-list')).toBeVisible();
-      await expect(host.locator('.room-header-actions .btn')).toHaveCount(4);
+      await expect(host.locator('.room-header-actions .btn')).toHaveCount(5);
       const actionLines = await textLineCounts(host, '.room-header-actions .btn');
-      expect(actionLines, '房间次操作文案被拆成了多行').toEqual([1, 1, 1, 1]);
+      expect(actionLines, '房间次操作文案被拆成了多行').toEqual([1, 1, 1, 1, 1]);
       for (const box of await rectsOf(host, '.room-header-actions .btn')) {
         expect(box.bottom - box.top, '房间次操作点击区不足 44px').toBeGreaterThanOrEqual(44);
       }
@@ -156,7 +156,7 @@ test.describe('手机 375px', () => {
       expect((await rectOf(host, '.col-center')).top).toBeLessThan((await rectOf(host, '.game-tabs')).top);
       expect((await rectOf(host, '.col-center')).top).toBeLessThan((await rectOf(host, '.col-players')).top);
       await expectNoHorizontalOverflow(host);
-      expect(await textLineCounts(host, '.room-header-actions .btn')).toEqual([1, 1, 1, 1]);
+      expect(await textLineCounts(host, '.room-header-actions .btn')).toEqual([1, 1, 1, 1, 1]);
       await host.setViewportSize(PHONE);
 
       // —— 截图：先回顶部、等碗停稳、点数与权威记录一致 ——

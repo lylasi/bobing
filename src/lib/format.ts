@@ -1,21 +1,46 @@
 /**
- * 展示层纯函数：结算原因文案、判奖文案、战绩排序与时间格式。
+ * 展示层纯函数：结算原因文案、判奖文案、战绩排序、结束方式文案与累计统计。
  *
- * 与规则有关的判断全部来自 shared/rules.ts 的常量，不在这里复制第二份规则。
+ * 与规则有关的判断全部来自 shared/rules.ts 与 shared/rulesets.ts，不在这里复制第二份规则。
  */
 
-import { NORMAL_PRIZE_KEYS, PRIZE_META, PRIZE_KEYS } from '../../shared/rules.js';
-import type { DiceResult, FinishedReason, Player, PrizeKey, RoomState, RollRecord } from '../../shared/types.js';
+import { NORMAL_PRIZE_KEYS, PRIZE_META, PRIZE_KEYS, resultRow } from '../../shared/rules.js';
+import type {
+  DiceResult,
+  EndCondition,
+  FinishedReason,
+  Player,
+  PrizeConfig,
+  PrizeKey,
+  RoomState,
+  RollRecord,
+} from '../../shared/types.js';
 
 export const FINISHED_REASON_LABELS: Readonly<Record<FinishedReason, string>> = {
   'round-limit': '达到轮数上限',
   'pool-empty': '普通奖全部领完，完成本轮后结算',
   'host-ended': '房主提前结束',
   'players-left': '在座玩家不足2人',
+  'offline-expired': '离线过期、未完成',
+  'all-left': '全员离席、未完成',
 };
 
 export function finishedReasonLabel(reason: FinishedReason | null): string {
   return reason ? FINISHED_REASON_LABELS[reason] : '本局已结束';
+}
+
+export function endConditionLabel(value: EndCondition): string {
+  return value.mode === 'all-prizes'
+    ? '奖品发完结束'
+    : '每人 ' + value.maxRounds + ' 轮';
+}
+
+export function turnRoundLabel(room: RoomState): string {
+  const round = Math.max(1, room.round);
+  if (room.config.endCondition.mode === 'rounds') {
+    return `第 ${round}/${room.config.endCondition.maxRounds} 轮`;
+  }
+  return `第 ${round} 轮`;
 }
 
 export function totalNormalAwards(awards: Readonly<Record<PrizeKey, number>>): number {
@@ -26,9 +51,21 @@ export function totalAwards(awards: Readonly<Record<PrizeKey, number>>): number 
   return PRIZE_KEYS.reduce((sum, key) => sum + awards[key], 0);
 }
 
+export function totalConfiguredPrizes(prizes: PrizeConfig): number {
+  return PRIZE_KEYS.reduce((sum, key) => sum + (prizes[key]?.count ?? 0), 0);
+}
+
+export function totalInitialPool(room: RoomState): number {
+  return PRIZE_KEYS.reduce((sum, key) => sum + (room.initialPool?.[key] ?? room.config.prizes[key]?.count ?? 0), 0);
+}
+
+export function totalInitialNormalPool(room: RoomState): number {
+  return NORMAL_PRIZE_KEYS.reduce((sum, key) => sum + (room.initialPool?.[key] ?? room.config.prizes[key]?.count ?? 0), 0);
+}
+
 /**
  * 战绩排序（rules-research 4.2）：状元拥有者优先，其次普通奖总数降序，最后入座顺序升序。
- * 只影响展示，不产生积分。
+ * 只影响展示，不产生积分。离席得主仍保留在本局记录中，不过滤。
  */
 export function standings(players: readonly Player[]): Player[] {
   return [...players].sort((a, b) => {
@@ -50,6 +87,26 @@ export function timeoutCountOf(history: readonly RollRecord[], playerId: string)
   return history.filter((record) => record.playerId === playerId && record.reason === 'timeout').length;
 }
 
+/** 读取玩家本局累计投掷次数（优先服务端累计字段，不受 240 条历史窗口裁剪影响）。 */
+export function playerRollCount(player: Player, history: readonly RollRecord[] = []): number {
+  return typeof player.rollCount === 'number' ? player.rollCount : rollCountOf(history, player.id);
+}
+
+/** 读取玩家本局累计超时跳过次数（优先服务端累计字段，不受 240 条历史窗口裁剪影响）。 */
+export function playerTimeoutCount(player: Player, history: readonly RollRecord[] = []): number {
+  return typeof player.timeoutCount === 'number' ? player.timeoutCount : timeoutCountOf(history, player.id);
+}
+
+/** 全桌本局累计实际投掷总数（来自各玩家 rollCount 之和）。 */
+export function totalRoomRolls(room: RoomState): number {
+  return room.players.reduce((sum, player) => sum + playerRollCount(player, room.history), 0);
+}
+
+/** 全桌本局累计超时跳过总数（来自各玩家 timeoutCount 之和）。 */
+export function totalRoomTimeouts(room: RoomState): number {
+  return room.players.reduce((sum, player) => sum + playerTimeoutCount(player, room.history), 0);
+}
+
 export interface RollHeadline {
   /** 主标题，例如“博得三红 · 获得1份”。 */
   title: string;
@@ -59,13 +116,27 @@ export interface RollHeadline {
 }
 
 /** 把一条投掷记录翻译成设计规范中的中文文案（同一份文案用于碗下方与记录列表）。 */
-export function describeRoll(record: RollRecord): RollHeadline {
+export function describeRoll(record: RollRecord, room?: RoomState | null): RollHeadline {
   if (record.reason === 'timeout' || record.result === null) {
     return { title: '本轮超时，已跳过', detail: '超时不掷骰、不发奖，消耗一次机会', tone: 'empty' };
   }
   const result = record.result;
   if (result.prize === 'zhuangyuan') {
-    return { title: `博得${result.label}`, detail: '计入状元候选，结束时发给领先者', tone: 'champion' };
+    if (room?.champion?.locked) {
+      if (room.champion.playerId === record.playerId && room.champion.at === record.at) {
+        return {
+          title: `博得${result.label} · 状元已锁定`,
+          detail: '高阶牌型锁定状元得主，本局继续至结束时发放状元奖',
+          tone: 'champion',
+        };
+      }
+      return {
+        title: `博得${result.label}`,
+        detail: '本局状元已由高阶牌型锁定，整局结束时发给已锁定得主',
+        tone: 'champion',
+      };
+    }
+    return { title: `博得${result.label}`, detail: '计入状元候选，结束时发给状元得主', tone: 'champion' };
   }
   if (result.prize !== null) {
     if (record.awarded === result.prize) {
@@ -80,10 +151,25 @@ export function prizeLabelOf(key: PrizeKey): string {
   return PRIZE_META[key].label;
 }
 
-/** 当前状元领先者（用于奖池区金底卡）。 */
+/** 当前状元领先者（用于奖池区金底卡与结算页）。 */
 export function championPlayer(room: RoomState): Player | null {
   if (!room.champion) return null;
   return room.players.find((player) => player.id === room.champion?.playerId) ?? null;
+}
+
+/** 状元状态标题：严格区分“当前状元，仍可被顶替”、“状元已锁定”、“最终状元”。 */
+export function championStatusTitle(room: RoomState): string {
+  if (room.status === 'finished') return '最终状元';
+  if (!room.champion) return '当前状元候选';
+  if (room.champion.locked) return '状元已锁定';
+  return '当前状元，仍可被顶替';
+}
+
+/** 触发高阶锁定的牌型中文名。 */
+export function championLockedByLabel(room: RoomState): string | null {
+  if (!room.champion?.locked) return null;
+  const code = room.champion.lockedBy ?? room.champion.result.code;
+  return resultRow(code).label;
 }
 
 export function playerById(room: RoomState, playerId: string | null): Player | null {

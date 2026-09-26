@@ -1,12 +1,16 @@
 /**
- * 房间服务：创建、加入、身份恢复、动作、凭证、公共快照、在线状态与计时。
+ * 房间服务：创建、加入、身份恢复、动作、凭证、公共快照、在线状态、到期与归档。
  *
- * 设计要点（product-spec 第 5、7 节）：
- *  - 服务端是随机数、轮次、权限、奖池、判奖、结算的唯一权威；客户端不能提交骰子。
+ * 设计要点（spec 2026-09-26 第 4、5、7 节）：
+ *  - 服务端是随机数、轮次、权限、奖池、判奖、结束与结算的唯一权威；客户端不能提交骰子。
  *  - 状态读取、校验、更新与 SQLite 事务全过程同步，中间不 await，因此单进程内
  *    两个并发请求只会有一个成功改变同一个 turnId。
- *  - 每次变更先落盘、再广播完整公共快照（含递增 revision）。
+ *  - 每次变更先落盘、再广播完整公共快照（含递增 revision）；写库失败回退到已提交状态。
  *  - 公共快照按白名单构造，绝不展开内部成员对象，凭证哈希不会泄漏。
+ *  - 配置只在等待室由房主修改，开局后冻结；规则快照随房间保存，不随注册表更新改判。
+ *  - 活跃对局 expiresAt 为 null；全员离线起 24 小时，重连取消，重启不顺延。
+ *  - 每个结束（完成／中止／全员离席／离线过期）都在同一事务写入独立归档，
+ *    归档不随房间清理删除，且只保存白名单公共快照。
  *  - `now`、`rollDice`、`pickStartSeat` 等注入点只存在于本类构造函数，
  *    仅供测试注入确定性随机与时钟，不存在 HTTP/Socket 作弊入口。
  */
@@ -14,7 +18,6 @@
 import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
   DEFAULT_MAX_PLAYERS,
-  DEFAULT_MAX_ROUNDS,
   HOST_TRANSFER_MS,
   MAX_PLAYERS,
   MIN_PLAYERS,
@@ -26,23 +29,26 @@ import {
   ROUND_OPTIONS,
   TURN_DURATION_MS,
 } from '../shared/rules.js';
+import { createDefaultRoomConfig, normalizeRoomConfig, poolFromConfig } from '../shared/room-config.js';
+import { snapshotRuleset } from '../shared/rulesets.js';
 import { ERROR_HTTP_STATUS, ERROR_MESSAGES } from '../shared/types.js';
 import type {
   Action,
   Champion,
   DiceResult,
   ErrorCode,
+  FinishedReason,
   Membership,
   Player,
+  RoomConfig,
   RoomPreview,
   RoomState,
   RollRecord,
 } from '../shared/types.js';
-import type { AppDatabase } from './db.js';
+import type { AppDatabase, ArchiveRow } from './db.js';
 import {
   activePlayers,
   allActiveOffline,
-  allActiveOnline,
   applyRoll,
   countActive,
   createInternalRoom,
@@ -58,6 +64,7 @@ import {
   transferHost,
 } from './game.js';
 import type { InternalPlayer, InternalRoom } from './game.js';
+import { normalizeStoredRoom, readArchiveIdentity, readPublicArchiveSnapshot } from './room-migrations.js';
 
 export class ServiceError extends Error {
   readonly code: ErrorCode;
@@ -99,7 +106,10 @@ export interface CreateRoomInput {
   nickname: unknown;
   name: unknown;
   maxPlayers: unknown;
-  maxRounds: unknown;
+  /** 新客户端发送的完整配置；缺省时按 maxRounds 或默认配置处理。 */
+  config?: unknown;
+  /** 旧客户端遗留的固定轮数；与 config 同时出现时拒绝。 */
+  maxRounds?: unknown;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -131,7 +141,12 @@ function safeEqualHex(a: string, b: string): boolean {
 }
 
 function cloneResult(result: DiceResult): DiceResult {
-  return { code: result.code, label: result.label, prize: result.prize, rankKey: [result.rankKey[0], result.rankKey[1], result.rankKey[2]] };
+  return {
+    code: result.code,
+    label: result.label,
+    prize: result.prize,
+    rankKey: [result.rankKey[0], result.rankKey[1], result.rankKey[2]],
+  };
 }
 
 function cloneRollRecord(record: RollRecord): RollRecord {
@@ -159,6 +174,8 @@ function toPublicPlayer(player: InternalPlayer): Player {
     left: player.left,
     awards: { ...player.awards },
     best: player.best ? cloneResult(player.best) : null,
+    rollCount: player.rollCount,
+    timeoutCount: player.timeoutCount,
   };
 }
 
@@ -168,13 +185,21 @@ function toPublicPlayer(player: InternalPlayer): Player {
  */
 export function toPublicRoom(room: InternalRoom): RoomState {
   const champion: Champion | null = room.champion
-    ? { playerId: room.champion.playerId, result: cloneResult(room.champion.result), dice: [...room.champion.dice], at: room.champion.at }
+    ? {
+        playerId: room.champion.playerId,
+        result: cloneResult(room.champion.result),
+        dice: [...room.champion.dice],
+        at: room.champion.at,
+        locked: room.champion.locked,
+        lockedBy: room.champion.lockedBy,
+      }
     : null;
   return {
     code: room.code,
     name: room.name,
     maxPlayers: room.maxPlayers,
-    maxRounds: room.maxRounds,
+    config: structuredClone(room.config),
+    ruleset: structuredClone(room.ruleset),
     rulesVersion: room.rulesVersion,
     status: room.status,
     hostId: room.hostId,
@@ -187,12 +212,30 @@ export function toPublicRoom(room: InternalRoom): RoomState {
     deadline: room.deadline,
     paused: room.paused,
     pool: { ...room.pool },
+    initialPool: { ...room.initialPool },
     champion,
+    closingRound: room.closingRound,
+    incomplete: room.incomplete,
+    allOfflineSince: room.allOfflineSince,
     history: room.history.map(cloneRollRecord),
     finishedReason: room.finishedReason,
     createdAt: room.createdAt,
     expiresAt: room.expiresAt,
   };
+}
+
+/** 两份已归一化配置是否完全一致（决定改配置是否算“实际变化”）。 */
+function sameConfig(a: RoomConfig, b: RoomConfig): boolean {
+  if (a.rulesetId !== b.rulesetId) return false;
+  if (a.endCondition.mode !== b.endCondition.mode) return false;
+  if (a.endCondition.mode === 'rounds' && b.endCondition.mode === 'rounds' && a.endCondition.maxRounds !== b.endCondition.maxRounds) {
+    return false;
+  }
+  for (const key of Object.keys(a.prizes) as Array<keyof RoomConfig['prizes']>) {
+    if (a.prizes[key].count !== b.prizes[key].count) return false;
+    if (a.prizes[key].content !== b.prizes[key].content) return false;
+  }
+  return true;
 }
 
 /**
@@ -269,9 +312,17 @@ export class RoomService {
     if (cached) return cached;
     const row = this.db.getRoom(code);
     if (!row) return null;
-    const room = JSON.parse(row.stateJson) as InternalRoom;
+    const room = this.readStoredRoom(row.stateJson, row.expiresAt);
     this.cache.set(room.code, room);
     return room;
+  }
+
+  /**
+   * 旧快照在这里一次性补齐新字段（旧结构没有到期时间，回退用数据库行的值）；
+   * 新格式损坏会抛错，不会被当成旧数据静默兜底。
+   */
+  private readStoredRoom(stateJson: string, rowExpiresAt: number | null): InternalRoom {
+    return normalizeStoredRoom(JSON.parse(stateJson) as unknown, { fallbackExpiresAt: rowExpiresAt });
   }
 
   private requireRoom(code: string): InternalRoom {
@@ -281,21 +332,26 @@ export class RoomService {
       if (this.db.isExpiredCode(code)) throw new ServiceError('ROOM_EXPIRED');
       throw new ServiceError('ROOM_NOT_FOUND');
     }
-    if (room.expiresAt <= this.nowFn()) throw new ServiceError('ROOM_EXPIRED');
+    // 活跃对局 expiresAt 为 null，不受创建后 24 小时截断
+    if (room.expiresAt !== null && room.expiresAt <= this.nowFn()) throw new ServiceError('ROOM_EXPIRED');
     return room;
   }
 
   /**
    * 先落盘、再广播；公共快照在 revision 递增之后构造。
+   * 处于终局（finished／closed）且本局真正开过局时，同一事务写入独立归档：
+   * 完成、中止、全员离席都不会因为之后的清理丢失记录。
    * 写库失败时驱逐内存中被改动过的对象并回退到数据库中的已提交状态，
    * 避免未提交的奖池/记录/回合被后续请求读到，也绝不广播失败结果。
    */
   private commit(room: InternalRoom, extra?: () => void): RoomState {
     room.revision += 1;
+    const archive = this.archiveRowFor(room, this.nowFn());
     try {
       const stateJson = JSON.stringify(room);
       this.db.transaction(() => {
         this.db.saveRoom({ code: room.code, stateJson, expiresAt: room.expiresAt, revision: room.revision });
+        if (archive) this.db.saveArchive(archive);
         extra?.();
       });
     } catch (error) {
@@ -307,26 +363,87 @@ export class RoomService {
     return snapshot;
   }
 
+  /**
+   * 归档行：只保存白名单公共快照，绝不含凭证或哈希。
+   * `expired` 用于离线过期：此时不调用会补发状元的 finishGame，
+   * 只记录实际已发的奖品并标记“未完成”。
+   */
+  private archiveRowFor(room: InternalRoom, now: number, expired = false): ArchiveRow | null {
+    // 本局从未开始（等待室直接关闭）不产生对局记录
+    if (room.startedAt === null) return null;
+    const playing = room.status === 'playing';
+    if (!playing && room.status !== 'finished' && room.status !== 'closed') return null;
+
+    if (expired && playing) {
+      const draft: InternalRoom = {
+        ...room,
+        status: 'closed',
+        finishedReason: 'offline-expired',
+        incomplete: true,
+        deadline: null,
+        turnPlayerId: null,
+        turnId: null,
+        paused: false,
+        pauseRemainingMs: null,
+      };
+      return {
+        code: room.code,
+        roomCreatedAt: room.createdAt,
+        gameNumber: room.gameNumber,
+        stateJson: JSON.stringify(toPublicRoom(draft)),
+        archivedAt: now,
+        reason: 'offline-expired',
+        incomplete: true,
+      };
+    }
+    if (playing) return null;
+
+    const reason: FinishedReason = room.finishedReason ?? (room.status === 'closed' ? 'all-left' : 'round-limit');
+    return {
+      code: room.code,
+      roomCreatedAt: room.createdAt,
+      gameNumber: room.gameNumber,
+      stateJson: JSON.stringify(toPublicRoom(room)),
+      archivedAt: now,
+      reason,
+      incomplete: room.incomplete,
+    };
+  }
+
   /** 写库失败后的恢复：创建失败不得留下虚假房间，更新失败回到已提交状态。 */
   private reloadFromDatabaseAfterFailure(code: string): void {
     this.cache.delete(code);
     try {
       const row = this.db.getRoom(code);
       if (!row) return; // 新建房间写入失败：内存里也不保留
-      this.cache.set(code, JSON.parse(row.stateJson) as InternalRoom);
+      this.cache.set(code, this.readStoredRoom(row.stateJson, row.expiresAt));
     } catch (reloadError) {
       console.error('[bobing] 写库失败后重新加载房间也失败，已从内存驱逐', code, reloadError);
     }
   }
 
-  /** 清理过期房间：删除房间/回执/归档，留下墓碑并断开该房间的连接引用。 */
+  /**
+   * 清理过期房间：先在一个事务里保存未完成归档、删除临时记录、写过期墓碑；
+   * 事务成功后才删除内存缓存、presence 并通知实时层，失败时保持原状等待下次 tick，
+   * 不会出现“库里删了、内存还在”的分裂。
+   */
   private purgeExpiredRoom(code: string, now: number): void {
-    this.cache.delete(code);
-    this.clearPresence(code);
+    let room: InternalRoom | null = null;
+    try {
+      room = this.loadRoom(code);
+    } catch (error) {
+      console.error('[bobing] 过期房间快照无法解析，跳过归档', code, error);
+    }
+    const archive = room ? this.archiveRowFor(room, now, true) : null;
+
     this.db.transaction(() => {
+      if (archive) this.db.saveArchive(archive);
       this.db.deleteRoom(code);
       this.db.markExpired(code, now);
     });
+
+    this.cache.delete(code);
+    this.clearPresence(code);
     try {
       this.purgeHandler?.(code);
     } catch (error) {
@@ -373,17 +490,60 @@ export class RoomService {
     }
   }
 
+  private normalizeConfigOrInvalid(value: unknown): RoomConfig {
+    try {
+      return normalizeRoomConfig(value);
+    } catch {
+      throw new ServiceError('INVALID_INPUT');
+    }
+  }
+
+  /** 结束转换后的到期时间：活跃为 null，其余状态从这次转换起算 24 小时。 */
+  private applyTransitionExpiry(room: InternalRoom, now: number): void {
+    room.expiresAt = room.status === 'playing' ? null : now + this.roomTtlMs;
+  }
+
+  /**
+   * 在席成员全部离线：立刻暂停并保存剩余时间，离线起点只在首次转换时写入一次，
+   * 重复调用（断开、离席、tick、重启）都不会顺延 24 小时。返回是否有变化。
+   */
+  private markAllOffline(room: InternalRoom, now: number): boolean {
+    let changed = false;
+    if (!room.paused) {
+      pauseRoom(room, now);
+      changed = true;
+    }
+    if (room.allOfflineSince === null) {
+      room.allOfflineSince = now;
+      changed = true;
+    }
+    const expiresAt = room.allOfflineSince + this.roomTtlMs;
+    if (room.expiresAt !== expiresAt) {
+      room.expiresAt = expiresAt;
+      changed = true;
+    }
+    return changed;
+  }
+
   // —— 生命周期 ——
 
   /**
-   * 进程启动：所有连接状态置离线，进行中的对局暂停（保留剩余毫秒），
-   * 不能把重启前的回合立刻判超时。返回恢复的房间数。
+   * 进程启动：所有连接状态置离线，进行中的对局暂停（保留剩余毫秒）并把离线起点落盘一次
+   * （已有起点原样保留，重启不顺延 24 小时）。同时把旧 completed_games 迁入独立归档。
+   * 返回恢复的房间数。
    */
   onBoot(now: number = this.nowFn()): number {
     this.presence.clear();
+    this.migrateLegacyArchives();
     let resumed = 0;
     for (const code of this.db.listRoomCodes(now)) {
-      const room = this.loadRoom(code);
+      let room: InternalRoom | null = null;
+      try {
+        room = this.loadRoom(code);
+      } catch (error) {
+        console.error('[bobing] 房间快照无法解析，已跳过恢复', code, error);
+        continue;
+      }
       if (!room) continue;
       let changed = false;
       for (const player of room.players) {
@@ -397,6 +557,19 @@ export class RoomService {
         const wasPaused = room.paused;
         pauseRoom(room, now);
         if (!wasPaused) changed = true;
+        if (room.allOfflineSince === null) {
+          room.allOfflineSince = now;
+          changed = true;
+        }
+        const expiresAt = room.allOfflineSince + this.roomTtlMs;
+        if (room.expiresAt !== expiresAt) {
+          room.expiresAt = expiresAt;
+          changed = true;
+        }
+      } else if (room.expiresAt === null) {
+        // 旧快照可能没有到期时间：补齐一次，之后不再随每次加载顺延
+        room.expiresAt = now + this.roomTtlMs;
+        changed = true;
       }
       if (changed) this.commit(room);
       resumed += 1;
@@ -404,12 +577,78 @@ export class RoomService {
     return resumed;
   }
 
-  /** 每秒时钟：超时跳过、全员离线暂停、房主离线转交、过期清理。 */
+  /**
+   * 旧 completed_games 迁移：兼容表里可能是两种格式——
+   *  - 当前代码“再开一局”写入的白名单公共快照（没有 turnOrder／tokenHash 等内部字段）；
+   *  - 更早版本留下的 InternalRoom 快照（可能带凭证哈希）。
+   * 一律先用 (房码, 建房时间, 局号) 查重：已经归档的同一局直接跳过，不换格式重新解析，也不重复写入。
+   * 未归档的公共快照按公共白名单原样补写归档；未归档的 InternalRoom 仍走 normalizeStoredRoom
+   * 的严格校验与白名单迁移（凭证不进入归档）。两种格式都读不懂的行照旧记录错误并跳过，不静默兜底。
+   */
+  private migrateLegacyArchives(): void {
+    for (const row of this.db.listLegacyCompletedGames()) {
+      try {
+        const raw = JSON.parse(row.stateJson) as unknown;
+        const identity = readArchiveIdentity(raw);
+        if (identity && this.isArchived(identity.code, identity.createdAt, row.gameNumber)) continue;
+        const archive = this.archiveFromLegacyCompletedGame(row, raw);
+        if (archive) this.db.saveArchive(archive, { keepExisting: true });
+      } catch (error) {
+        console.error('[bobing] 旧完成对局迁入归档失败，已跳过', row.roomCode, row.gameNumber, error);
+      }
+    }
+  }
+
+  /**
+   * 未归档的旧完成对局 -> 归档行。已归档时返回 null（不覆盖已有归档）。
+   * 公共快照本身就是归档格式，原样补写；真正的 InternalRoom 快照才归一化后转白名单。
+   */
+  private archiveFromLegacyCompletedGame(
+    row: { roomCode: string; gameNumber: number; stateJson: string; finishedAt: number },
+    raw: unknown,
+  ): ArchiveRow | null {
+    const publicSnapshot = readPublicArchiveSnapshot(raw);
+    if (publicSnapshot && publicSnapshot.code === row.roomCode) {
+      if (this.isArchived(publicSnapshot.code, publicSnapshot.createdAt, row.gameNumber)) return null;
+      return {
+        code: publicSnapshot.code,
+        roomCreatedAt: publicSnapshot.createdAt,
+        gameNumber: row.gameNumber,
+        stateJson: row.stateJson,
+        archivedAt: row.finishedAt,
+        reason: publicSnapshot.finishedReason ?? 'round-limit',
+        incomplete: publicSnapshot.incomplete,
+      };
+    }
+    // 真实旧 InternalRoom 快照：严格校验后只写出白名单公共快照，凭证哈希不带入归档
+    const room = normalizeStoredRoom(raw);
+    if (this.isArchived(room.code, room.createdAt, row.gameNumber)) return null;
+    return {
+      code: room.code,
+      roomCreatedAt: room.createdAt,
+      gameNumber: row.gameNumber,
+      stateJson: JSON.stringify(toPublicRoom(room)),
+      archivedAt: row.finishedAt,
+      reason: room.finishedReason ?? 'round-limit',
+      incomplete: room.incomplete,
+    };
+  }
+
+  /** 该 (房码, 建房时间, 局号) 是否已经有独立归档。 */
+  private isArchived(code: string, roomCreatedAt: number, gameNumber: number): boolean {
+    return this.db.listArchives(code, roomCreatedAt).some((archive) => archive.gameNumber === gameNumber);
+  }
+
+  /** 每秒时钟：超时跳过、全员离线暂停/到期、房主离线转交、过期清理。 */
   tick(now: number = this.nowFn()): string[] {
     const changed: string[] = [];
 
     for (const code of this.db.listExpiredCodes(now)) {
-      this.purgeExpiredRoom(code, now);
+      try {
+        this.purgeExpiredRoom(code, now);
+      } catch (error) {
+        console.error('[bobing] 过期房间清理失败，保留现状等待下次 tick', code, error);
+      }
     }
     this.db.purgeExpiredTombstones(now - ROOM_TOMBSTONE_TTL_MS);
 
@@ -429,16 +668,33 @@ export class RoomService {
       if (!room.paused && room.deadline !== null && now >= room.deadline) {
         if (skipExpiredTurn(room, now)) changed = true;
       }
-      if (room.status === 'playing') {
-        if (room.paused && allActiveOnline(room) && activePlayers(room).length > 0) {
-          resumeRoom(room, now);
+      if (room.status !== 'playing') {
+        // 最后一次机会因超时把本局结算完：从结算时刻起重新计算 24 小时
+        room.expiresAt = now + this.roomTtlMs;
+        changed = true;
+      } else {
+        const active = activePlayers(room);
+        const someoneOnline = active.some((player) => player.online);
+        if (active.length === 0) {
+          // 全员主动离席：未完成关闭，记录保留
+          finishGame(room, 'all-left', now);
+          room.expiresAt = now + this.roomTtlMs;
           changed = true;
-        } else if (!room.paused && allActiveOffline(room) && activePlayers(room).length > 0) {
-          pauseRoom(room, now);
-          changed = true;
-        }
-        if (countActive(room) < MIN_PLAYERS) {
-          finishGame(room, 'players-left', now);
+        } else if (someoneOnline) {
+          if (room.paused) {
+            resumeRoom(room, now);
+            changed = true;
+          }
+          if (room.allOfflineSince !== null) {
+            // 有人在线即取消本次离线到期计时
+            room.allOfflineSince = null;
+            changed = true;
+          }
+          if (room.expiresAt !== null) {
+            room.expiresAt = null;
+            changed = true;
+          }
+        } else if (this.markAllOffline(room, now)) {
           changed = true;
         }
       }
@@ -447,7 +703,7 @@ export class RoomService {
     // 房主离线 60 秒后有在线成员则自动转交；自动转交只考虑在线候选人，
     // 全员离线时保持原房主，避免把房主交给另一个离线成员。
     const host = findPlayer(room, room.hostId);
-    if (host && !host.left && !host.online) {
+    if (host && host.left === false && !host.online) {
       if (room.hostOfflineSince === null) {
         room.hostOfflineSince = now;
         changed = true;
@@ -474,11 +730,33 @@ export class RoomService {
       name: room.name,
       playerCount,
       maxPlayers: room.maxPlayers,
-      maxRounds: room.maxRounds,
+      config: structuredClone(room.config),
+      ruleset: structuredClone(room.ruleset),
       status: room.status,
       rulesVersion: room.rulesVersion,
       canJoin: room.status === 'waiting' && playerCount < room.maxPlayers,
+      expiresAt: room.expiresAt,
     };
+  }
+
+  /** 创建房间的配置来源：新客户端 config，旧客户端 maxRounds 显式映射，两者同时出现拒绝。 */
+  private resolveCreateConfig(input: CreateRoomInput): RoomConfig {
+    const hasConfig = input.config !== undefined && input.config !== null;
+    const hasMaxRounds = input.maxRounds !== undefined && input.maxRounds !== null;
+    if (hasConfig && hasMaxRounds) throw new ServiceError('INVALID_INPUT');
+    if (hasConfig) return this.normalizeConfigOrInvalid(input.config);
+    if (hasMaxRounds) {
+      const maxRounds = input.maxRounds;
+      if (typeof maxRounds !== 'number' || !(ROUND_OPTIONS as readonly number[]).includes(maxRounds)) {
+        throw new ServiceError('INVALID_INPUT');
+      }
+      return this.normalizeConfigOrInvalid({
+        ...createDefaultRoomConfig(),
+        endCondition: { mode: 'rounds', maxRounds: maxRounds as 5 | 10 | 20 },
+      });
+    }
+    // 都没有时使用默认：持续顶状元 + 奖品发完结束
+    return createDefaultRoomConfig();
   }
 
   create(input: CreateRoomInput, clientIp: string): { membership: Membership; room: RoomState } {
@@ -488,10 +766,7 @@ export class RoomService {
     if (typeof maxPlayers !== 'number' || !Number.isInteger(maxPlayers) || maxPlayers < MIN_PLAYERS || maxPlayers > MAX_PLAYERS) {
       throw new ServiceError('INVALID_INPUT');
     }
-    const maxRounds = input.maxRounds;
-    if (typeof maxRounds !== 'number' || !(ROUND_OPTIONS as readonly number[]).includes(maxRounds)) {
-      throw new ServiceError('INVALID_INPUT');
-    }
+    const config = this.resolveCreateConfig(input);
     const now = this.nowFn();
     this.checkRateLimit(`create:${clientIp}`, this.limits.createJoinPerMinute, now);
 
@@ -502,11 +777,12 @@ export class RoomService {
       code,
       name,
       maxPlayers,
-      maxRounds: maxRounds as 5 | 10 | 20,
+      config,
       hostId: playerId,
       hostNickname: nickname,
       hostTokenHash: hashToken(token),
       now,
+      // 等待室从创建起 24 小时；开局后置为 null，不受创建时间截断
       expiresAt: now + this.roomTtlMs,
       turnDurationMs: this.turnDurationMs,
     });
@@ -540,6 +816,8 @@ export class RoomService {
       left: false,
       awards: { zhuangyuan: 0, duitang: 0, sanhong: 0, sijin: 0, erju: 0, yixiu: 0 },
       best: null,
+      rollCount: 0,
+      timeoutCount: 0,
       tokenHash: hashToken(token),
       lastSeenAt: now,
     });
@@ -558,7 +836,8 @@ export class RoomService {
   /** 只读快照（Socket 首帧、广播复用同一构造器）。 */
   getSnapshot(code: string): RoomState | null {
     const room = this.loadRoom(code);
-    if (!room || room.expiresAt <= this.nowFn()) return null;
+    if (!room) return null;
+    if (room.expiresAt !== null && room.expiresAt <= this.nowFn()) return null;
     return this.snapshot(room);
   }
 
@@ -586,6 +865,8 @@ export class RoomService {
         return this.handleEnd(room, player, now);
       case 'rematch':
         return this.handleRematch(room, player, now);
+      case 'update-config':
+        return this.handleUpdateConfig(room, player, action.config, now);
       default:
         throw new ServiceError('INVALID_INPUT');
     }
@@ -608,6 +889,7 @@ export class RoomService {
     const readyToStart =
       active.length >= MIN_PLAYERS && active.length <= room.maxPlayers && active.every((candidate) => candidate.online && candidate.ready);
     if (!readyToStart) throw new ServiceError('NOT_READY');
+    // 开局即冻结本局配置与规则快照：startGame 从 config 重建库存并清空统计
     startGame(room, now, this.pickStartSeatFn(active.length));
     return { room: this.commit(room) };
   }
@@ -627,7 +909,10 @@ export class RoomService {
     }
     // 到期与下一次 tick 之间迟到的请求：先把这一回合按超时结算并落盘，再让客户端同步
     if (now >= room.deadline) {
-      if (skipExpiredTurn(room, now)) this.commit(room);
+      if (skipExpiredTurn(room, now)) {
+        if (room.status !== 'playing') room.expiresAt = now + this.roomTtlMs;
+        this.commit(room);
+      }
       throw new ServiceError('STALE_TURN');
     }
     // 先判回合是否已经过去（重试/双击时语义是“这一轮已经结束”），
@@ -641,6 +926,8 @@ export class RoomService {
 
     const gameNumber = room.gameNumber;
     const record = applyRoll(room, player.id, dice, now);
+    // 本局可能在这一手收尾（奖品发完／轮数上限）
+    if (room.status !== 'playing') room.expiresAt = now + this.roomTtlMs;
     const snapshot = this.commit(room, () => {
       this.db.saveReceipt({
         roomCode: room.code,
@@ -657,6 +944,7 @@ export class RoomService {
   private handleLeave(room: InternalRoom, player: InternalPlayer, now: number): { room: RoomState } {
     if (player.left) return { room: this.snapshot(room) };
     const wasPlaying = room.status === 'playing';
+    const wasWaiting = room.status === 'waiting';
 
     player.left = true;
     player.ready = false;
@@ -669,17 +957,23 @@ export class RoomService {
 
     if (wasPlaying) {
       dropCurrentTurnIfPlayer(room, player.id, now);
-      if (room.status === 'playing' && countActive(room) < MIN_PLAYERS) {
-        finishGame(room, 'players-left', now);
-      }
+      // 开局后只剩一位在席成员时继续轮转；全员主动离席按未完成关闭并保留记录
+      if (room.status === 'playing' && countActive(room) === 0) finishGame(room, 'all-left', now);
     }
-    if (countActive(room) === 0) {
+    if (wasWaiting && countActive(room) === 0) {
+      // 等待室从未开局：直接关闭，不制造对局记录
       room.status = 'closed';
       room.deadline = null;
       room.paused = false;
       room.pauseRemainingMs = null;
       room.turnPlayerId = null;
       room.turnId = null;
+    }
+    if (room.status === 'playing' && countActive(room) > 0 && allActiveOffline(room)) {
+      // 最后一位在线成员离席，其余成员只是离线：立刻暂停并建立离线期限
+      this.markAllOffline(room, now);
+    } else if (room.status !== 'playing' && (wasPlaying || wasWaiting)) {
+      this.applyTransitionExpiry(room, now);
     }
     room.lastActivityAt = now;
     return { room: this.commit(room) };
@@ -688,7 +982,9 @@ export class RoomService {
   private handleEnd(room: InternalRoom, player: InternalPlayer, now: number): { room: RoomState } {
     if (room.hostId !== player.id) throw new ServiceError('HOST_ONLY');
     if (room.status !== 'playing') throw new ServiceError('INVALID_STATE');
+    // 中止时已有状元按既有提前结算行为发给当时得主；没有则显示空缺，剩余奖品保留
     finishGame(room, 'host-ended', now);
+    this.applyTransitionExpiry(room, now);
     return { room: this.commit(room) };
   }
 
@@ -696,15 +992,42 @@ export class RoomService {
     if (room.hostId !== player.id) throw new ServiceError('HOST_ONLY');
     if (room.status !== 'finished') throw new ServiceError('INVALID_STATE');
     const archivedGameNumber = room.gameNumber;
-    const archivedJson = JSON.stringify(room);
+    // 归档与旧表都只保存白名单公共快照，凭证哈希不进入历史记录
+    const archive = this.archiveRowFor(room, now);
+    const publicJson = JSON.stringify(toPublicRoom(room));
     prepareRematch(room, now);
+    room.expiresAt = now + this.roomTtlMs;
     const snapshot = this.commit(room, () => {
-      this.db.saveCompletedGame(room.code, archivedGameNumber, archivedJson, now);
+      if (archive) this.db.saveArchive(archive);
+      this.db.saveCompletedGame(room.code, archivedGameNumber, publicJson, now);
     });
     return { room: snapshot };
   }
 
-  /** Socket 连接建立：引用计数 +1，首位回来的成员恢复倒计时。 */
+  /**
+   * 等待室改配置：只有房主可以，开局后拒绝。
+   * 验证通过且配置确有变化才替换配置、按配置重建满额库存，并取消其他在席玩家的准备
+   * （房主准备状态原样保留）；失败不落盘、不广播。
+   */
+  private handleUpdateConfig(room: InternalRoom, player: InternalPlayer, rawConfig: unknown, now: number): { room: RoomState } {
+    if (room.hostId !== player.id) throw new ServiceError('HOST_ONLY');
+    if (room.status !== 'waiting') throw new ServiceError('INVALID_STATE');
+    const config = this.normalizeConfigOrInvalid(rawConfig);
+    if (sameConfig(room.config, config)) return { room: this.snapshot(room) };
+
+    room.config = config;
+    // 开局前改配置同时更新规则快照与初始奖池；开局后配置不可改，快照随之冻结
+    room.ruleset = snapshotRuleset(config.rulesetId);
+    room.initialPool = poolFromConfig(config);
+    room.pool = { ...room.initialPool };
+    for (const other of activePlayers(room)) {
+      if (other.id !== room.hostId) other.ready = false;
+    }
+    room.lastActivityAt = now;
+    return { room: this.commit(room) };
+  }
+
+  /** Socket 连接建立：引用计数 +1，首位回来的成员取消离线到期并恢复倒计时。 */
   connectMember(rawCode: string, token: unknown): { room: RoomState; playerId: string } {
     const code = normalizeRoomCode(rawCode);
     const room = this.requireRoom(code);
@@ -715,11 +1038,13 @@ export class RoomService {
 
   /**
    * 连接引用计数 +1（Socket 已通过 handshake 鉴权后调用）。
-   * 同一成员多连接只有最后一个断开才算离线；第一位回来的成员恢复 deadline。
+   * 同一成员多连接只有最后一个断开才算离线；第一位回来的成员取消离线到期、
+   * 清空 allOfflineSince 并恢复 deadline。
    */
   openConnection(code: string, playerId: string): RoomState | null {
     const room = this.loadRoom(code);
-    if (!room || room.expiresAt <= this.nowFn()) return null;
+    if (!room) return null;
+    if (room.expiresAt !== null && room.expiresAt <= this.nowFn()) return null;
     const player = findPlayer(room, playerId);
     if (!player || player.left) return null;
     const now = this.nowFn();
@@ -737,9 +1062,20 @@ export class RoomService {
       room.hostOfflineSince = null;
       changed = true;
     }
-    if (room.status === 'playing' && room.paused) {
-      resumeRoom(room, now);
-      changed = true;
+    if (room.status === 'playing') {
+      if (room.paused) {
+        resumeRoom(room, now);
+        changed = true;
+      }
+      // 有人回来即取消这次离线 24 小时计时；活跃对局不设固定到期
+      if (room.allOfflineSince !== null) {
+        room.allOfflineSince = null;
+        changed = true;
+      }
+      if (room.expiresAt !== null) {
+        room.expiresAt = null;
+        changed = true;
+      }
     }
     return changed ? this.commit(room) : this.snapshot(room);
   }
@@ -773,9 +1109,9 @@ export class RoomService {
       room.hostOfflineSince = now;
       changed = true;
     }
-    if (room.status === 'playing' && !room.paused && allActiveOffline(room) && activePlayers(room).length > 0) {
-      pauseRoom(room, now);
-      changed = true;
+    if (room.status === 'playing' && activePlayers(room).length > 0 && allActiveOffline(room)) {
+      // 全员离线：立刻暂停并保存剩余时间，24 小时只从这次转换起算一次
+      if (this.markAllOffline(room, now)) changed = true;
     }
     if (changed) this.commit(room);
     return changed;
@@ -812,5 +1148,4 @@ export function normalizeRoomCode(raw: unknown): string {
 
 export const DEFAULTS = {
   maxPlayers: DEFAULT_MAX_PLAYERS,
-  maxRounds: DEFAULT_MAX_ROUNDS,
 } as const;

@@ -1,6 +1,6 @@
 # 实测记录（P6 / P7 / P8 测试准备 / P9 部署）
 
-本文按开发批次记录**实际执行过**的命令与结果；最新结果见第9节（119条单元/集成与22条E2E），早期数量与截图结论保留为历史记录。主代理的最终签收见 [primary-final-verification.md](primary-final-verification.md)。尚未验证的公网、真机等范围在各批次末尾单列。
+本文按开发批次保留历史实测记录。2026-09-26 可配置房规、奖品、音效与动画的最新进度及验证结果见 [可配置玩法集成验收](configurable-play-verification.md)。下文第 9 节的 119 条单元／集成与 22 条 E2E，以及 [此前独立验收](primary-final-verification.md)，均为本次功能开发前的历史基线。尚未验证的公网、真机等范围在各批次末尾单列。
 环境：macOS（darwin 25.x，Apple Silicon）、Node v24.20.0、npm 11、Docker 29.4.0（OrbStack）、Playwright 1.62.0 自带 Chromium 1234。
 
 ---

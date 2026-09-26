@@ -1,12 +1,12 @@
 /**
  * 本局记录：一行一次机会，含昵称、点阵、牌型与实际发奖。
- * 超时记录没有骰子；最多展示服务端保留的上限条数，列表自身滚动。
+ * 超时记录没有骰子；列表仅展示最近 240 条窗口，完整累计次数独立保存在玩家统计中。
  */
 
 import type { ReactElement } from 'react';
-import type { RollRecord } from '../../shared/types.js';
-import { DiceRow } from './Dice.js';
+import type { RoomState, RollRecord } from '../../shared/types.js';
 import { describeRoll } from '../lib/format.js';
+import { DiceRow } from './Dice.js';
 
 function formatTime(at: number): string {
   const date = new Date(at);
@@ -14,21 +14,29 @@ function formatTime(at: number): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-export function History({ history, limit = 240 }: { history: readonly RollRecord[]; limit?: number }): ReactElement {
+export function History({
+  history,
+  room = null,
+  limit = 240,
+}: {
+  history: readonly RollRecord[];
+  room?: RoomState | null;
+  limit?: number;
+}): ReactElement {
   const records = [...history].slice(-limit).reverse();
 
   return (
     <div className="history">
       <div className="panel-heading">
         <h3>本局记录</h3>
-        <span className="panel-meta">{history.length} 条</span>
+        <span className="panel-meta">最近 {records.length} 条（最多保留 240 条）</span>
       </div>
       {records.length === 0 ? (
         <p className="empty-state">骰声未起，第一份好运等你开启。</p>
       ) : (
         <ol className="record-list">
           {records.map((record) => {
-            const headline = describeRoll(record);
+            const headline = describeRoll(record, room);
             return (
               <li key={record.id} className={`record record--${headline.tone}`}>
                 <span className="record-time">{formatTime(record.at)}</span>
@@ -52,6 +60,7 @@ export function History({ history, limit = 240 }: { history: readonly RollRecord
           })}
         </ol>
       )}
+      <p className="panel-footnote">仅显示最近 240 条记录；完整累计投掷与超时次数以玩家统计为准。</p>
     </div>
   );
 }

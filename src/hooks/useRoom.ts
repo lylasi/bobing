@@ -218,6 +218,7 @@ export function useRoom(code: string, token: string): UseRoomResult {
   const runAction = useCallback(
     async (action: Action): Promise<ActionOutcome> => {
       setBusy(true);
+      setActionMessage(null);
       try {
         const response = await sendAction(code, token, action);
         merge(response.room);
@@ -225,7 +226,9 @@ export function useRoom(code: string, token: string): UseRoomResult {
       } catch (error) {
         const apiError = toApiError(error);
         rollAttemptRef.current = null;
-        setActionMessage({ code: apiError.code, text: apiError.message });
+        if (action.type !== 'update-config') {
+          setActionMessage({ code: apiError.code, text: apiError.message });
+        }
         try {
           await refresh();
         } catch {

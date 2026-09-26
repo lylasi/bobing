@@ -10,7 +10,7 @@
 import express from 'express';
 import type { Express, NextFunction, Request, Response } from 'express';
 import { ERROR_MESSAGES } from '../shared/types.js';
-import type { Action, ErrorCode } from '../shared/types.js';
+import type { Action, ErrorCode, RoomConfig } from '../shared/types.js';
 import { RoomService, ServiceError, isUuid } from './room-service.js';
 
 export const MAX_BODY_BYTES = 16 * 1024;
@@ -84,6 +84,8 @@ function bearerToken(req: Request): string {
 /**
  * 解析并校验 Action。未知字段（例如客户端擅自提交的 dice、points）一律忽略，
  * 服务端永远不会读取客户端的骰子点数。
+ * `update-config` 只在这里做形状检查，完整配置校验由服务层的 normalizeRoomConfig 完成
+ * （非法值统一映射为 INVALID_INPUT）。
  */
 export function parseAction(body: Record<string, unknown>): Action {
   const type = body.type;
@@ -105,6 +107,13 @@ export function parseAction(body: Record<string, unknown>): Action {
       return { type: 'end' };
     case 'rematch':
       return { type: 'rematch' };
+    case 'update-config': {
+      const config = body.config;
+      if (typeof config !== 'object' || config === null || Array.isArray(config)) {
+        fail('INVALID_INPUT', 'config 必须是房间配置对象');
+      }
+      return { type: 'update-config', config: config as RoomConfig };
+    }
     default:
       fail('INVALID_INPUT', '未知的操作类型');
   }
@@ -141,7 +150,13 @@ export function createApp(service: RoomService, options: AppOptions = {}): Expre
     try {
       const body = requireObjectBody(req);
       const created = service.create(
-        { nickname: body.nickname, name: body.name, maxPlayers: body.maxPlayers, maxRounds: body.maxRounds },
+        {
+          nickname: body.nickname,
+          name: body.name,
+          maxPlayers: body.maxPlayers,
+          config: body.config,
+          maxRounds: body.maxRounds,
+        },
         clientIp(req),
       );
       res.status(201).json(created);

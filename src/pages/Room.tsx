@@ -5,24 +5,27 @@
  * 凭证失效只清理当前房间的记录，并回到落地页说明原因。
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 import type { Membership } from '../../shared/types.js';
-import { GameBoard } from '../components/GameBoard.js';
 import { ConfirmDialog } from '../components/ConfirmDialog.js';
 import { Dialog } from '../components/Dialog.js';
+import { GameBoard } from '../components/GameBoard.js';
 import { Results } from '../components/Results.js';
 import { RoomHeader } from '../components/RoomHeader.js';
 import { RoomLanding } from '../components/RoomLanding.js';
 import { RulesContent } from '../components/RulesContent.js';
 import { ShareDialog } from '../components/ShareDialog.js';
+import { SiteHeader } from '../components/SiteHeader.js';
 import { WaitingRoom } from '../components/WaitingRoom.js';
 import { useDiceAnimation } from '../hooks/useDiceAnimation.js';
 import { useRoom } from '../hooks/useRoom.js';
 import { useInviteUrl } from '../hooks/useShareBaseUrl.js';
+import { useSoundSettings } from '../hooks/useSoundSettings.js';
+import { createDiceSound } from '../lib/dice-sound.js';
+import type { DiceSoundController } from '../lib/dice-sound.js';
 import { isValidRoomCode, Link, navigate, useTitle } from '../lib/router.js';
 import { clearMembership, loadMembership } from '../lib/session.js';
-import { SiteHeader } from '../components/SiteHeader.js';
 
 interface MemberViewProps {
   code: string;
@@ -34,7 +37,33 @@ interface MemberViewProps {
 function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): ReactElement {
   const { room, playerId, loading, fatal, loadError, retry, connection, actionMessage, clearActionMessage, busy, rollPending, now, runAction, roll } =
     useRoom(code, membership.token);
-  const { dice, spinning, revealed } = useDiceAnimation(room, playerId, rollPending);
+  const { dice, spinning, revealed, phase, settledCount } = useDiceAnimation(room, playerId, rollPending);
+  const { enabled: soundEnabled, setEnabled: setSoundEnabled } = useSoundSettings();
+
+  const soundRef = useRef<DiceSoundController | null>(null);
+  const getSound = useCallback((): DiceSoundController => {
+    if (!soundRef.current) {
+      soundRef.current = createDiceSound();
+    }
+    return soundRef.current;
+  }, []);
+
+  useEffect(() => {
+    if (!soundRef.current) {
+      soundRef.current = createDiceSound();
+    }
+    return () => {
+      soundRef.current?.dispose();
+      soundRef.current = null;
+    };
+  }, []);
+
+  // 请求失败或静音时立即停止正在播放的音效
+  useEffect(() => {
+    if (!soundEnabled || (actionMessage !== null && !rollPending && !spinning)) {
+      soundRef.current?.stop();
+    }
+  }, [soundEnabled, actionMessage, rollPending, spinning]);
 
   const [shareOpen, setShareOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
@@ -44,14 +73,40 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
   useTitle(room ? `${room.name} · 月满博饼` : '月满博饼');
 
   useEffect(() => {
-    // 只有服务端明确回答 INVALID_TOKEN 才清理本机身份；
-    // 网络中断、超时、500 属于可恢复错误，绝不能把玩家踢回入房表单
     if (fatal?.code === 'INVALID_TOKEN') onInvalid(fatal.message);
   }, [fatal, onInvalid]);
 
-  // 分享链接的基地址来自运行时配置，配置到达后会自动更新
   const inviteUrl = useInviteUrl(code);
   const isHost = room?.hostId === playerId;
+
+  const handleToggleSound = useCallback((): void => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    if (next) {
+      void getSound().unlock();
+    } else {
+      soundRef.current?.stop();
+    }
+  }, [soundEnabled, setSoundEnabled, getSound]);
+
+  const handleRoll = useCallback((): void => {
+    if (
+      soundEnabled &&
+      room &&
+      room.status === 'playing' &&
+      room.turnId &&
+      room.turnPlayerId === playerId &&
+      connection === 'connected' &&
+      !rollPending &&
+      !spinning &&
+      !room.paused
+    ) {
+      const sound = getSound();
+      void sound.unlock();
+      sound.start();
+    }
+    void roll();
+  }, [soundEnabled, room, playerId, connection, rollPending, spinning, getSound, roll]);
 
   const handleLeave = useCallback(async (): Promise<void> => {
     setLeaveError(null);
@@ -60,7 +115,6 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
       const me = outcome.room?.players.find((player) => player.id === playerId);
       const leftConfirmed = !outcome.room || outcome.room.status === 'closed' || me === undefined || me.left;
       if (!leftConfirmed) {
-        // 服务端接受了请求但快照里席位仍在：留在房间等下一次同步，绝不假装已离开
         setLeaveError('服务端还没有确认你的离开，请稍后重试。');
         return;
       }
@@ -72,14 +126,12 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
 
     const errorCode = outcome.error?.code ?? null;
     if (errorCode === 'INVALID_TOKEN' || errorCode === 'ROOM_NOT_FOUND' || errorCode === 'ROOM_EXPIRED' || errorCode === 'INVALID_INPUT') {
-      // 身份已被服务端撤销（或房间已不存在）：等同于已经离开，可以清理并回首页
       setConfirm(null);
       clearMembership(code);
       onLeft();
       return;
     }
 
-    // 网络失败/超时/500：保留身份、留在房间，弹层里给出可重试的提示
     setConfirm('leave');
     setLeaveError('离开没有成功（网络异常），你仍在房间里，身份也已保留，可以重试。');
   }, [code, onLeft, playerId, runAction]);
@@ -143,6 +195,8 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
         connection={connection}
         isHost={Boolean(isHost)}
         showHostEnd={room.status === 'playing'}
+        soundEnabled={soundEnabled}
+        onToggleSound={handleToggleSound}
         onInvite={() => setShareOpen(true)}
         onRules={() => setRulesOpen(true)}
         onEndRequest={() => setConfirm('end')}
@@ -167,6 +221,7 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
           onReady={(ready) => void runAction({ type: 'ready', ready })}
           onStart={() => void runAction({ type: 'start' })}
           onInvite={() => setShareOpen(true)}
+          onUpdateConfig={(config) => runAction({ type: 'update-config', config })}
         />
       ) : null}
 
@@ -177,10 +232,12 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
           connection={connection}
           rollPending={rollPending}
           spinning={spinning}
+          phase={phase}
+          settledCount={settledCount}
           dice={dice}
           revealed={revealed}
           now={now}
-          onRoll={() => void roll()}
+          onRoll={handleRoll}
         />
       ) : null}
 
@@ -194,7 +251,7 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
             onRematch={() => void runAction({ type: 'rematch' })}
             onLeaveRequest={() => setConfirm('leave')}
           />
-          <p className="results-footnote">再开一局会保留房码与身份，奖品与本局记录重新开始。</p>
+          <p className="results-footnote">再开一局会沿用本房间的房规与奖品配置，并重置本局库存与统计记录。</p>
         </>
       ) : null}
 
@@ -210,8 +267,8 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
 
       <ShareDialog open={shareOpen} roomCode={room.code} roomName={room.name} inviteUrl={inviteUrl} onClose={() => setShareOpen(false)} />
 
-      <Dialog open={rulesOpen} title="线上统一房规 v1" onClose={() => setRulesOpen(false)} width="lg">
-        <RulesContent compact />
+      <Dialog open={rulesOpen} title={`${room.ruleset.name} · 房间规则`} onClose={() => setRulesOpen(false)} width="lg">
+        <RulesContent compact room={room} />
       </Dialog>
 
       <ConfirmDialog

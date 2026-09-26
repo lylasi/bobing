@@ -35,7 +35,7 @@ export async function screenshot(page: Page, name: string): Promise<void> {
   await page.screenshot({ path: `${SCREENSHOT_DIR}/${name}.png`, fullPage: true });
 }
 
-/** 首页创建房间，返回房间码。 */
+/** 首页创建房间，返回房间码（rounds 参数代表选择“固定轮数”并设置对应轮数）。 */
 export async function createRoom(
   page: Page,
   options: { nickname: string; roomName: string; maxPlayers: number; rounds: 5 | 10 | 20 },
@@ -45,7 +45,8 @@ export async function createRoom(
   await page.getByLabel('你的昵称').fill(options.nickname);
   await page.getByLabel('房间名称').fill(options.roomName);
   await page.getByLabel('人数上限').fill(String(options.maxPlayers));
-  await page.getByRole('button', { name: `${options.rounds} 轮` }).click();
+  await page.getByRole('radio', { name: '固定轮数' }).check();
+  await page.getByRole('button', { name: `${options.rounds} 轮`, exact: true }).click();
   await page.getByRole('button', { name: '创建房间' }).click();
   await expect(page).toHaveURL(/\/room\/[A-Z0-9]{6}$/);
   const code = new URL(page.url()).pathname.split('/').pop()!;
@@ -65,11 +66,16 @@ export async function readInviteUrl(page: Page): Promise<string> {
   return url;
 }
 
-/** 通过邀请链接落地：先看到房间概况，再输入昵称加入。 */
-export async function joinByInvite(page: Page, inviteUrl: string, nickname: string): Promise<void> {
+/** 通过邀请链接落地：先看到房间概况（断言真实系统房规名称），再输入昵称加入。 */
+export async function joinByInvite(
+  page: Page,
+  inviteUrl: string,
+  nickname: string,
+  expectedRuleset = '持续顶状元',
+): Promise<void> {
   await page.goto(inviteUrl);
   await expect(page.getByText('收到邀请')).toBeVisible();
-  await expect(page.getByText('线上统一房规 v1').first()).toBeVisible();
+  await expect(page.getByText(expectedRuleset).first()).toBeVisible();
   await page.getByLabel('你的昵称').fill(nickname);
   await page.getByRole('button', { name: '加入房间' }).click();
   await expect(page.getByRole('heading', { name: '等好友入席' })).toBeVisible();

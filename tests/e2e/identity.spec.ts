@@ -124,12 +124,13 @@ test.describe('身份保持与离开', () => {
       await expect(guest.getByRole('heading', { name: '离开失败局' })).toBeVisible();
       expect(await readMembership(guest, code), '离开失败时凭证被清理了').toEqual(before);
 
-      // 恢复网络后重试：这次真的离开，房主端看到结算
+      // 恢复网络后重试：这次真的离开，房主端看到小满已离开且对局继续（A14：单人仍可继续投掷）
       await guest.unroute(ACTIONS_ROUTE);
       await dialog.getByRole('button', { name: '确认离开' }).click();
       await expect(guest).toHaveURL(/\/$/, { timeout: 20_000 });
       expect(await readMembership(guest, code)).toBeNull();
-      await expect(host.getByText('在座玩家不足2人')).toBeVisible({ timeout: 20_000 });
+      await expect(host.locator('.room-meta-item', { hasText: '1/3 人' })).toBeVisible({ timeout: 20_000 });
+      await expect(host.getByRole('button', { name: '掷出好运' }).first()).toBeEnabled({ timeout: 20_000 });
     } finally {
       await hostContext.close();
       await guestContext.close();

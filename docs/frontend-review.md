@@ -22,6 +22,12 @@
 
 主代理亲自查看最终候选截图后，还发现手机对局中心被隐藏、记录点阵与文字重叠等问题，已单列在 [最终审查补充](final-review-addendum.md)。必须连同本清单完成验收。
 
-## 最终状态（2026-09-26）
+## 2026-09-26 可配置房规、个人方案与骰子音效动画补充审查
 
-本清单1–8全部已解决。网络错误保身份、恢复重试、连续两投后刷新两端点数一致、失败离开仍在席、真实超时后刷新与再开局均经过主代理独立浏览器验证；延迟分享配置、500、INVALID_TOKEN、失败投掷和倒计时禁投有浏览器回归。首页与移动标题已人工看图。最终119条单元/集成、22条E2E通过，证据见 [主代理验收](primary-final-verification.md) 和 [开发侧第8、9批实测](verification.md)。
+主代理依据 [可配置玩法规格](superpowers/specs/2026-09-26-bobing-configurable-play.md) 对前端实现进行了审查，以下 5 项问题已全部修复并补充单元与真实浏览器回归验证：
+
+1. **`RoomConfigForm` 非法数量草稿保留与按档位精确同步（4a & 单档同步修复）**：修复了 `useEffect([value.prizes])` 在用户清空某档数量后继续编辑奖品内容或修改另一档数量时将非法空值重置回旧合法数量的问题；通过记录 `changedKeys` 仅更新外部真正发生数值变化的档位（而恢复默认数量与载入个人方案则显式重置全部六档 `rawCounts`），用户未修正非法数量时即使收起高级区也保留草稿、展示 `role="alert"` 并禁用提交。
+2. **首页默认开房表单长度收敛与等待室默认展开（UI 收尾审查）**：首页 `RoomConfigForm` 默认收起“调整奖品与个人方案”展开区（`aria-expanded="false"` + `aria-controls`，触达高度 `>= 44px`），默认状态仅展示昵称/房名/人数、系统房规、结束方式、随草稿实时更新的奖品摘要及“创建房间”按钮；等待室“修改房规与奖品”弹层传入 `defaultAdvancedOpen` 默认展开全部编辑字段。实测 375×812 下首页默认“创建房间”按钮 `Y = 1385px`（较此前 `3804px` 缩短 `2419px`）、页面总高 `2411px`（较此前 `5066px` 缩短 `2655px`）；1440×900 下“创建房间”按钮 `Y = 767px`（底边 `819px < 900px`，首屏直接可见）且左右双栏高度均衡无大块留白。
+3. **`useDiceAnimation` 同次提交 HTTP 先于 WebSocket 返回时不跳过本人动画（4b）**：将新记录消费 effect 置于 `rollPending` effect 之前，并以 `latestKeyRef.current === startedFrom && appliedKeyRef.current === startedFrom` 判定“请求结束但无新记录”，通过 Playwright `routeWebSocket` 延后 `room:state` 验证本人 HTTP 响应先到时仍完整播放分阶段动画。
+4. **`stageForElapsed` 逐颗停稳完整覆盖 `0..6`（4c）**：修正 `stageForElapsed` 之前跳过 `settledCount = 2` 的问题，确保 `settledCount` 从 `0, 1, 2, 3, 4, 5, 6` 逐颗递增停稳，阶段完整覆盖 `tumbling -> landing -> colliding -> settling -> idle`。
+5. **`Room.tsx` 音效控制器在 React StrictMode 与卸载时的准确清理（4d）**：移除 render 阶段副作用创建，改为在 effect 与惰性 getter 中管理 `soundRef.current`，卸载或路由离开时准确调用当前控制器的 `dispose()` 关闭 `AudioContext`；未开启音效或非本人新投掷时绝不发声。

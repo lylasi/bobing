@@ -1,31 +1,34 @@
 /**
  * 首页：左侧品牌文案与瓷碗主视觉，右侧创建/加入表单卡片，底部三步流程与六档奖项速览。
- * 奖项与步骤全部来自 shared/rules.ts 的真实规则数据，不出现假的在线人数。
+ * 奖项与步骤读取当前创建配置草稿与 shared 真实规则，不出现假的在线人数。
  */
 
-import { useId, useState } from 'react';
+import { useCallback, useId, useState } from 'react';
 import type { FormEvent, ReactElement } from 'react';
+import { createDefaultRoomConfig, normalizeRoomConfig } from '../../shared/room-config.js';
 import {
   DEFAULT_MAX_PLAYERS,
-  DEFAULT_MAX_ROUNDS,
   DEFAULT_ROOM_NAME,
   MAX_PLAYERS,
   MIN_PLAYERS,
   NICKNAME_MAX_LENGTH,
   PRIZE_KEYS,
   PRIZE_META,
-  ROUND_OPTIONS,
 } from '../../shared/rules.js';
+import { RULESETS } from '../../shared/rulesets.js';
+import type { RoomConfig } from '../../shared/types.js';
+import { Bowl } from '../components/Bowl.js';
+import { RoomConfigForm } from '../components/RoomConfigForm.js';
+import { SiteHeader } from '../components/SiteHeader.js';
 import { ApiError, createRoom, describeError, joinRoom, previewRoom } from '../lib/api.js';
+import { endConditionLabel, totalConfiguredPrizes } from '../lib/format.js';
 import { navigate } from '../lib/router.js';
 import { saveMembership } from '../lib/session.js';
-import { Bowl } from '../components/Bowl.js';
-import { SiteHeader } from '../components/SiteHeader.js';
 
 type Tab = 'create' | 'join';
 
 const STEPS: ReadonlyArray<{ title: string; text: string }> = [
-  { title: '创建房间', text: '起个房名，选好人数与轮数，立刻开桌。' },
+  { title: '创建房间', text: '起个房名，选好系统房规、结束方式与奖品，立刻开桌。' },
   { title: '分享邀请', text: '把邀请链接或房码发给好友，输入昵称即可入席。' },
   { title: '轮流博饼', text: '轮流掷六颗骰子，先博到状元最有彩头。' },
 ];
@@ -55,11 +58,19 @@ export function Home(): ReactElement {
   const [nickname, setNickname] = useState('');
   const [roomName, setRoomName] = useState(DEFAULT_ROOM_NAME);
   const [maxPlayers, setMaxPlayers] = useState<number>(DEFAULT_MAX_PLAYERS);
-  const [maxRounds, setMaxRounds] = useState<number>(DEFAULT_MAX_ROUNDS);
+  const [config, setConfig] = useState<RoomConfig>(() => createDefaultRoomConfig());
+  const [configValid, setConfigValid] = useState(true);
+  const [configError, setConfigError] = useState<string | null>(null);
+
   const [joinCode, setJoinCode] = useState('');
   const [joinNickname, setJoinNickname] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  const handleValidityChange = useCallback((valid: boolean, message: string | null) => {
+    setConfigValid(valid);
+    setConfigError(message);
+  }, []);
 
   const submitCreate = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -72,7 +83,16 @@ export function Home(): ReactElement {
     if (!Number.isInteger(maxPlayers) || maxPlayers < MIN_PLAYERS || maxPlayers > MAX_PLAYERS) {
       return setError(`人数上限请填 ${MIN_PLAYERS}–${MAX_PLAYERS} 的整数`);
     }
-    if (!(ROUND_OPTIONS as readonly number[]).includes(maxRounds)) return setError('每人轮数请选择 5、10 或 20');
+    if (!configValid) {
+      return setError(configError ?? '请检查房间配置与奖品数量');
+    }
+
+    let normalizedConfig: RoomConfig;
+    try {
+      normalizedConfig = normalizeRoomConfig(config);
+    } catch (validationError) {
+      return setError(describeError(validationError));
+    }
 
     setError(null);
     setSubmitting(true);
@@ -81,7 +101,7 @@ export function Home(): ReactElement {
         nickname: nickname.trim(),
         name: trimmedName,
         maxPlayers,
-        maxRounds: maxRounds as 5 | 10 | 20,
+        config: normalizedConfig,
       });
       saveMembership(created.membership);
       navigate(`/room/${created.room.code}`);
@@ -103,7 +123,6 @@ export function Home(): ReactElement {
     setError(null);
     setSubmitting(true);
     try {
-      // 先读概况：房间不存在/已开局/已满员时给出准确提示，而不是先建后报错
       const preview = await previewRoom(code);
       if (!preview.canJoin) {
         if (preview.status !== 'waiting') throw new ApiError('http', '本局已经开始，暂时不能加入');
@@ -119,6 +138,8 @@ export function Home(): ReactElement {
     }
   };
 
+  const totalPrizes = totalConfiguredPrizes(config.prizes);
+
   return (
     <div className="page page--home">
       <SiteHeader current="home" />
@@ -126,7 +147,6 @@ export function Home(): ReactElement {
         <div className="home-grid">
           <section className="home-hero">
             <p className="eyebrow">中秋欢聚 · 好彩头</p>
-            {/* 两段各自不拆：窄屏各占一行，桌面并排。aria-label 保证朗读与视觉文本一致 */}
             <h1 className="home-title" aria-label="一碗骰声，满桌团圆。">
               <span className="home-title-line" aria-hidden="true">
                 一碗骰声，
@@ -138,11 +158,10 @@ export function Home(): ReactElement {
             <p className="home-subtitle">开一桌中秋好彩头，邀三五好友一起博个状元。</p>
             <ul className="home-points">
               <li>创建房间 · 分享邀请 · 轮流博饼</li>
-              <li>无需注册，输入昵称即可入席</li>
+              <li>默认持续顶状元、奖品发完结束，支持本机保存个人方案</li>
               <li>奖品为虚拟记录，不涉及任何金额</li>
             </ul>
             <div className="home-visual">
-              {/* 主视觉是纯装饰（aria-hidden）：固定一组骰面示意，不代表任何真实房间数据 */}
               <Bowl dice={HERO_DICE} size="hero" decorative className="bowl--decorative" />
               <p className="home-visual-caption" aria-hidden="true">
                 六骰一掷，好运满桌
@@ -208,21 +227,21 @@ export function Home(): ReactElement {
                     <p className="field-hint">1–12个字，房间里不重名</p>
                   </div>
 
-                  <div className="form-field">
-                    <label className="field-label" htmlFor={nameId}>
-                      房间名称
-                    </label>
-                    <input
-                      id={nameId}
-                      className="input"
-                      value={roomName}
-                      onChange={(event) => setRoomName(event.target.value)}
-                      maxLength={40}
-                      required
-                    />
-                  </div>
-
                   <div className="form-row">
+                    <div className="form-field">
+                      <label className="field-label" htmlFor={nameId}>
+                        房间名称
+                      </label>
+                      <input
+                        id={nameId}
+                        className="input"
+                        value={roomName}
+                        onChange={(event) => setRoomName(event.target.value)}
+                        maxLength={40}
+                        required
+                      />
+                    </div>
+
                     <div className="form-field">
                       <label className="field-label" htmlFor={maxPlayersId}>
                         人数上限
@@ -242,26 +261,21 @@ export function Home(): ReactElement {
                         {MIN_PLAYERS}–{MAX_PLAYERS} 人
                       </p>
                     </div>
-
-                    <fieldset className="form-field">
-                      <legend className="field-label">每人轮数</legend>
-                      <div className="pill-group">
-                        {ROUND_OPTIONS.map((option) => (
-                          <button
-                            key={option}
-                            type="button"
-                            className={`pill ${maxRounds === option ? 'is-active' : ''}`}
-                            aria-pressed={maxRounds === option}
-                            onClick={() => setMaxRounds(option)}
-                          >
-                            {option} 轮
-                          </button>
-                        ))}
-                      </div>
-                    </fieldset>
                   </div>
 
-                  <button type="submit" className="btn btn-primary btn-block" disabled={submitting} aria-busy={submitting}>
+                  <RoomConfigForm
+                    value={config}
+                    onChange={setConfig}
+                    disabled={submitting}
+                    onValidityChange={handleValidityChange}
+                  />
+
+                  <button
+                    type="submit"
+                    className="btn btn-primary btn-block"
+                    disabled={submitting || !configValid}
+                    aria-busy={submitting}
+                  >
                     {submitting ? '正在开桌…' : '创建房间'}
                   </button>
                   <p className="form-footnote">无需注册，输入昵称即可入席。</p>
@@ -330,15 +344,22 @@ export function Home(): ReactElement {
         <section className="home-prizes">
           <h2 className="section-title">六档奖项速览</h2>
           <ul className="prize-overview">
-            {PRIZE_KEYS.map((key) => (
-              <li key={key}>
-                <span className="prize-overview-name">{PRIZE_META[key].label}</span>
-                <span className="prize-overview-count">{PRIZE_META[key].count} 份</span>
-                <span className="prize-overview-desc">{PRIZE_META[key].description}</span>
-              </li>
-            ))}
+            {PRIZE_KEYS.map((key) => {
+              const prize = config.prizes[key];
+              const content = prize.content.trim();
+              return (
+                <li key={key}>
+                  <span className="prize-overview-name">{PRIZE_META[key].label}</span>
+                  <span className="prize-overview-count">{prize.count} 份</span>
+                  {content !== '' ? <span className="prize-content">{content}</span> : null}
+                  <span className="prize-overview-desc">{PRIZE_META[key].description}</span>
+                </li>
+              );
+            })}
           </ul>
-          <p className="panel-footnote">共 63 份虚拟奖品，先到先得；状元在整局结束时发给领先者。</p>
+          <p className="panel-footnote">
+            当前配置：{RULESETS[config.rulesetId].name} · {endConditionLabel(config.endCondition)} · 共 {totalPrizes} 份虚拟奖品，普通奖先到先得，状元在整局结束时发给唯一状元得主。
+          </p>
         </section>
       </main>
     </div>

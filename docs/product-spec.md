@@ -19,19 +19,19 @@
 
 品牌“月满博饼”，主标语“一碗骰声，满桌团圆。”；创建房间、输入6位房间码加入、玩法说明三个明确入口。展示六档奖项速览、6颗骰子与瓷碗主视觉、无需注册的参与步骤。
 
-创建表单：昵称1–12个Unicode字符、房间名1–24字、人数上限2–12整数（默认8）、每人轮数5/10/20（默认10）。默认房名“中秋团圆局”，不能用占位文字替代字段label。提交期间禁用按钮。失败保留输入、显示可操作错误。成功跳转`/room/:code`并保存恢复凭证。
+创建表单：昵称1–12个Unicode字符、房间名1–24字、人数上限2–12整数（默认8）、系统房规（`持续顶状元`／`高阶锁定`，默认前者）、结束方式（`奖品发完`，或固定5/10/20轮，默认奖品发完）与六档奖品份数／内容（每档至少1份，默认63份）。默认房名“中秋团圆局”，不能用占位文字替代字段label。提交期间禁用按钮。失败保留输入、显示可操作错误。成功跳转`/room/:code`并保存恢复凭证。
 
 加入表单：房间码忽略首尾空格并转大写，昵称遵守同上规则；同房间昵称不能重复。同浏览器有该房间凭证时，优先恢复身份。
 
 ### 2.2 邀请落地页 `/room/:code`
 
-无恢复凭证时先读取概况：房名、人数/上限、轮数、规则名、是否可加入。等待中的房间输入昵称加入；已开始/已结束/已满/已过期时给出对应说明与回首页按钮，不能静默新建本地房间。
+无恢复凭证时先读取概况：房名、人数/上限、房规名、结束方式、奖品配置、是否可加入。等待中的房间输入昵称加入；已开始/已结束/已满/已过期时给出对应说明与回首页按钮，不能静默新建本地房间。
 
 有凭证时调用成员状态接口恢复；凭证失效时清理该房间凭证并展示加入页。凭证不能出现在URL、二维码、分享文本、日志或其他玩家数据中。
 
 ### 2.3 房间等待区
 
-显示6位房间码、房名、已入座成员、房主标记、在线/离线、准备状态、游戏配置。
+显示6位房间码、房名、已入座成员、房主标记、在线/离线、准备状态、游戏配置（房规、结束方式、六档奖品）。房主可在等待室修改配置：修改成功后服务端原子替换配置并按新配置重建满额奖池，同时取消其他成员的准备状态（房主准备状态保留）；配置没有实际变化时不重置准备状态。开局后配置冻结，不能再改。
 
 - 邀请按钮打开弹层：完整邀请链接、复制链接、二维码、系统分享（支持时）。复制失败必须显示可手动选择的链接，不假报复制成功。
 - HTTPS下优先`navigator.share`/Clipboard；HTTP局域网支持手动复制回退。二维码实际编码邀请URL，使用本地库生成。
@@ -40,23 +40,23 @@
 
 ### 2.4 对局区
 
-上方房名、轮次/上限、连接状态；中心显示当前掷骰人、剩余秒数、瓷碗和6颗骰子、上一手牌型结果；下方显示“掷出好运”按钮或等待提示。
+上方房名、当前轮次（固定轮数局显示“轮次/上限”，奖品发完局显示已进行轮数）、连接状态；中心显示当前掷骰人、剩余秒数、瓷碗和6颗骰子、上一手牌型结果；下方显示“掷出好运”按钮或等待提示。
 
 - 只有当前玩家能操作掷骰；等待别人、请求中、断线、已结束时禁用，并说明原因。
-- 动画约900ms，停下来的点数必须来自服务器响应；支持`prefers-reduced-motion`；网络失败不能擅自显示一组“中奖结果”。
+- 本人新投掷收到结果后播放约750ms的翻滚、落碗、碰撞与逐颗停稳动画，停下来的点数必须来自服务器响应；支持`prefers-reduced-motion`；网络失败不能擅自显示一组“中奖结果”。他人投掷直接显示结果，刷新、重连和重复快照不重播旧动画。
 - 当前结果显示名字、6点数、判奖和是否实际领到奖；奖池耗尽、刷新后恢复均有明确文案。
-- 旁边/下方显示玩家与准备/在线状态、五类普通奖剩余数、当前状元领先者、获奖明细、完整本局记录（最多240条，可滚动）。超时、离开、结束也有可读记录或状态提示。
-- 状元动画强于普通奖，但不遮挡必要操作；音效不作为第一版依赖。
+- 旁边/下方显示玩家与准备/在线状态、五类普通奖剩余数、当前状元领先者（锁定版显示已锁定）、获奖明细、完整本局记录（最近240条，可滚动）。超时、离开、结束也有可读记录或状态提示。每人的累计投掷与超时次数单独显示，不因240条窗口而失真。
+- 音效首次默认关闭，开关保存在当前浏览器；只为本人新发起的投掷播放翻滚、碰撞和落碗声，静音、请求失败或离开页面时清理播放。
 - 房主“提前结束”需应用内二次确认，这是用户产品操作的确认，不是开发代理的审批。
 - 离开房间需应用内确认；掉线提示自动重连，不能误当作主动离开。
 
 ### 2.5 结算区
 
-显示本局状元或空缺说明、结束原因、所有玩家奖项明细、实际投掷次数、剩余奖池、历史记录。只把实际已发奖品计入总数。房主点击“再开一局”将同房间切回等待区：房码/身份保留，离开者清理，所有奖品和本局记录重置，非房主准备取消，局编号加1；之前局的数据保存在数据库的已完成对局快照中。成员看到“等待房主再开一局”。
+显示本局状元或空缺说明、结束原因（奖品发完／固定轮数到上限／房主中止／全员离席／离线过期）、是否属于未完成的中止局、所有玩家奖项明细、实际投掷次数与超时次数、剩余奖池、历史记录。只把实际已发奖品计入总数：离线过期不补发状元；房主主动中止则沿用原行为，将状元档全部份数结算给当时的领先者，无候选则保留空缺，普通奖剩余库存不自动发放。房主点击“再开一局”将同房间切回等待区：房码/身份保留，离开者清理，所有奖品和本局记录重置，非房主准备取消，局编号加1；之前局的数据保存在数据库的独立归档中。成员看到“等待房主再开一局”。
 
 ### 2.6 规则页 `/rules` 与房间内规则弹层
 
-来自同一份常量数据。展示完整牌型示例、奖池数量、特殊牌型排序、30秒超时、轮数上限、只取最高奖、不兼得、不追普通奖、状元同分先到先得及参考来源。房间里查看规则不离开房间或断开连接。
+来自同一份常量数据。展示完整牌型示例、默认奖池数量、特殊牌型排序、30秒超时、两种结束方式、只取最高奖、不兼得、不追普通奖、两种房规的状元归属规则（持续顶替／高阶锁定）及参考来源。房间里查看规则不离开房间或断开连接。
 
 ## 3. 全局约束
 
@@ -92,7 +92,8 @@ shared/rules.ts              纯判奖函数、比较器、规则显示元数据
 server/index.ts              服务入口、生产静态资源、生命周期
 server/app.ts                HTTP路由与输入校验
 server/db.ts                 SQLite建表、事务、查询、归档
-server/room-service.ts       创建/加入/动作/凭证/公共快照
+server/room-service.ts       创建/加入/动作/凭证/公共快照/到期与归档
+server/room-migrations.ts    旧房间快照归一化与损坏检测
 server/game.ts               开局、轮转、发奖、结算的纯逻辑
 server/realtime.ts           Socket身份验证、订阅、断连计数、广播
 server/clock.ts              超时、暂停恢复、房主转交、过期清理
@@ -106,7 +107,8 @@ src/pages/Rules.tsx         规则页
 src/components/*            骰子、碗、玩家、奖池、记录、分享弹层
 src/styles.css             Pi设计规范的完整响应式样式
 tests/rules.test.ts         牌型/穷举/比较
-tests/game.test.ts          轮转/奖池/结算/超时
+tests/game.test.ts          轮转/奖池/结算/超时/收尾/锁定
+tests/db.test.ts            可空到期时间迁移、独立归档、旧快照归一化
 tests/server.test.ts        REST/权限/幂等/持久化/Socket
 tests/e2e/*.spec.ts         两个独立浏览器上下文的真实流程
 docs/ui-design.md           Pi交付的设计规范
@@ -125,24 +127,47 @@ type ResultCode = 'chajinhua'|'liuhong'|'biandijin'|'liuhe'|'wuhong'|'wuzi'|
 type RoomStatus = 'waiting'|'playing'|'finished'|'closed';
 type RankKey = [number, number, number];
 interface DiceResult { code: ResultCode; label: string; prize: PrizeKey|null; rankKey: RankKey }
+type RulesetId = 'continuous'|'high-tier-lock';
+interface PrizeConfig { count:number; content:string }
+type EndCondition = { mode:'all-prizes' } | { mode:'rounds'; maxRounds:5|10|20 };
+interface RoomConfig {
+  rulesetId:RulesetId; endCondition:EndCondition; prizes:Record<PrizeKey,PrizeConfig>;
+}
+interface RulesetSnapshot {
+  id:RulesetId; version:1; name:string; diceRulesVersion:'unified-v1';
+  championPolicy:'competitive'|'lock-high-tier'; lockCodes:ResultCode[];
+}
 interface Player {
   id:string; nickname:string; seat:number; ready:boolean; online:boolean;
   left:boolean; awards:Record<PrizeKey,number>; best:DiceResult|null;
+  rollCount:number; timeoutCount:number;
 }
 interface RollRecord {
   id:string; playerId:string; nickname:string; round:number; turnId:string;
   dice:number[]; result:DiceResult|null; awarded:PrizeKey|null;
   reason:'rolled'|'timeout'; at:number;
 }
-interface Champion { playerId:string; result:DiceResult; dice:number[]; at:number }
+interface Champion {
+  playerId:string; result:DiceResult; dice:number[]; at:number;
+  locked:boolean; lockedBy:ResultCode|null;
+}
+interface RoomPreview {
+  code:string; name:string; playerCount:number; maxPlayers:number;
+  config:RoomConfig; ruleset:RulesetSnapshot; status:RoomStatus;
+  rulesVersion:'unified-v1'; canJoin:boolean; expiresAt:number|null;
+}
 interface RoomState {
-  code:string; name:string; maxPlayers:number; maxRounds:5|10|20;
+  code:string; name:string; maxPlayers:number;
+  config:RoomConfig; ruleset:RulesetSnapshot;
   rulesVersion:'unified-v1'; status:RoomStatus; hostId:string; revision:number;
   players:Player[]; gameNumber:number; round:number; turnPlayerId:string|null;
   turnId:string|null; deadline:number|null; paused:boolean;
-  pool:Record<PrizeKey,number>; champion:Champion|null; history:RollRecord[];
-  finishedReason:'round-limit'|'pool-empty'|'host-ended'|'players-left'|null;
-  createdAt:number; expiresAt:number;
+  pool:Record<PrizeKey,number>; initialPool:Record<PrizeKey,number>;
+  champion:Champion|null; history:RollRecord[];
+  closingRound:number|null; incomplete:boolean; allOfflineSince:number|null;
+  finishedReason:'round-limit'|'pool-empty'|'host-ended'|'players-left'
+    |'offline-expired'|'all-left'|null;
+  createdAt:number; expiresAt:number|null;
 }
 interface Membership { roomCode:string; playerId:string; token:string }
 type Action =
@@ -151,14 +176,23 @@ type Action =
  | {type:'roll'; requestId:string; expectedTurnId:string}
  | {type:'leave'}
  | {type:'end'}
- | {type:'rematch'};
+ | {type:'rematch'}
+ | {type:'update-config'; config:RoomConfig};
 ```
 
-服务端内部类型额外保存`tokenHash`、`lastSeenAt`、暂停剩余毫秒、本轮结束标记与回合顺序；公共快照必须通过白名单构造，不能直接展开内部成员对象。
+创建房间时`config`与旧的`maxRounds`互斥：只传`maxRounds`时服务端映射为`{mode:'rounds',maxRounds}`的等价配置（旧客户端与旧数据保持原轮数），两者同时出现返回400，都不传时使用默认配置（持续顶状元＋奖品发完）。
 
-SQLite至少三张表：`rooms(code PRIMARY KEY, state_json, expires_at)`；`receipts(room_code, game_number, player_id, request_id, result_json, UNIQUE(...))`；`completed_games(room_code, game_number, state_json, PRIMARY KEY(...))`。启用WAL、外键和busy_timeout；状态变更和roll回执在同一事务提交。房间24小时后过期，过期访问返回410；清理过期房间时同时清理相关回执/归档。数据库文件不得放入Git。
+服务端内部类型额外保存`tokenHash`、`lastSeenAt`、暂停剩余毫秒、上一局结束标记与回合顺序；公共快照必须通过白名单构造，不能直接展开内部成员对象。房间保存的`ruleset`是开局时冻结的深拷贝：系统注册表之后改名或改锁定列表，都不改变已存房间的判定与展示。
 
-核心审查补充：采用`expired_rooms`保存只有房码和过期时间的轻量标记7天，以便清理完整数据后仍能返回410；7天后清理标记，原码返回404。24小时有效期从创建起固定计算，不随操作续期。服务重启时保存内容不丢失；若重启前deadline已过，剩余时长为0，首次重连后会跳过该回合。
+SQLite表：`rooms(code PRIMARY KEY, state_json, expires_at NULL, revision)`；`receipts(room_code, game_number, player_id, request_id, result_json, UNIQUE(...))`；`completed_games(room_code, game_number, state_json, PRIMARY KEY(...))`（旧版本遗留，保留兼容）；`room_archives(room_code, room_created_at, game_number, state_json, archived_at, reason, incomplete, PRIMARY KEY(room_code, room_created_at, game_number))`；`expired_rooms(code PRIMARY KEY, expired_at)`。启用WAL、外键和busy_timeout；状态变更和roll回执在同一事务提交，终局局面的归档也在同一事务写入。数据库文件不得放入Git。
+
+`rooms.expires_at`可空：对局进行中且还有人在线时为`null`，表示不受创建时间截断；旧库该列是`NOT NULL`，打开数据库时按表结构检测并在事务中重建表、拷贝全部旧行（幂等，可重复启动）。
+
+**到期计算**：等待室从创建起24小时；对局中有人在线不过期；全员离线立刻暂停并把离线起点落盘，24小时从离线起点算，重连即取消，重复断开／tick／重启都不顺延；完成、中止、全员离席、回到等待室都从那次状态转换起重新计算24小时。
+
+**归档**：每局结束都写入一条`room_archives`记录（完成／中止／全员离席／离线过期），保存白名单公共快照（不含凭证），`(房码, 建房时间, 局号)`为主键；清理房间只删除`rooms`与`receipts`，不删除归档。启动时把旧的`completed_games`归一化后迁入归档（已存在则不覆盖）。
+
+**过期清理**：`expired_rooms`保存只有房码和过期时间的轻量标记7天，以便清理完整数据后仍能返回410；7天后清理标记，原码返回404。清理顺序是先在一个事务里写归档、删房间、写墓碑，成功后才清内存缓存与在线引用；事务失败时不产生内存与数据库分裂，留到下次tick重试。服务重启时保存内容不丢失；若重启前deadline已过，剩余时长为0，首次重连后会跳过该回合。
 
 ## 6. API与Socket契约
 
@@ -168,11 +202,11 @@ SQLite至少三张表：`rooms(code PRIMARY KEY, state_json, expires_at)`；`rec
 | --- | --- | --- |
 | GET /api/health | 无 | 200 `{ok:true}`，数据库可用 |
 | GET /api/config | 无 | 200 `{publicBaseUrl:string|null}`；运行时公开分享地址配置，无凭证 |
-| POST /api/rooms | `{nickname,name,maxPlayers,maxRounds}` | 201 `{membership,room}`；创建者为房主，默认准备 |
-| GET /api/rooms/:code | 无 | 200 `{code,name,playerCount,maxPlayers,maxRounds,status,rulesVersion,canJoin}`；只暴露概况 |
+| POST /api/rooms | `{nickname,name,maxPlayers,config?,maxRounds?}` | 201 `{membership,room}`；创建者为房主，默认准备。`config`与`maxRounds`互斥，非法配置返回400 |
+| GET /api/rooms/:code | 无 | 200 `RoomPreview`（房码、房名、人数/上限、`config`、`ruleset`、状态、`expiresAt`、可否加入）；只暴露概况，不含成员与凭证 |
 | POST /api/rooms/:code/join | `{nickname}` | 201 `{membership,room}`；只能在waiting加入 |
 | GET /api/rooms/:code/state | Bearer token | 200 `{room,playerId}`；用于刷新和断线恢复 |
-| POST /api/rooms/:code/actions | Bearer token，`Action` | 200 `{room}`；所有操作走相同事务服务 |
+| POST /api/rooms/:code/actions | Bearer token，`Action`（含`update-config`） | 200 `{room}`；所有操作走相同事务服务。`update-config`仅房主、仅等待室，非法配置原子失败 |
 
 Socket.IO同源连接，handshake `auth:{roomCode,token}`，仅验证成功的成员可以进入对应房间；连接后推送`room:state`，内容`RoomState`。`connect_error`给出可读信息；服务端不接受未经验证的任意房间订阅。相同成员多个连接按引用计数，只有最后一个断开才标离线。`room:state`不得包含凭证或哈希。
 
@@ -204,19 +238,24 @@ stateDiagram-v2
   [*] --> waiting: 创建
   waiting --> playing: 房主开始且人数/准备/在线校验通过
   playing --> playing: 掷骰/超时/同步/暂停恢复
-  playing --> finished: 轮数上限/普通奖池空后整轮/房主结束/人数不足
+  playing --> finished: 普通奖发完收尾整轮结束/固定轮数上限/房主中止
+  playing --> closed: 全员主动离席（未完成，保留记录）
+  waiting --> closed: 所有人主动离开（本局从未开始，不产生记录）
   finished --> waiting: 房主再开一局
-  waiting --> closed: 所有人主动离开
-  finished --> closed: 所有人主动离开
-  closed --> [*]
+  waiting --> [*]: 到期清理（等待室从创建起24小时）
+  finished --> [*]: 到期清理（从结束时刻起24小时）
+  closed --> [*]: 到期清理
+  playing --> [*]: 到期清理（全员离线起24小时，未完成归档且不补发状元）
 ```
 
 - RNG为`crypto.randomInt(1,7)`，开局起始位同样使用服务端安全随机源。生产API不能接收或注入自选骰子。
 - 每个新回合生成UUID `turnId`；roll必须带`expectedTurnId`与UUID `requestId`。先查当前局该玩家的回执，再检查回合；重复请求返回原记录对应的已提交状态，不消耗下一次机会。
 - 单Node进程中状态读取、校验、更新和SQLite事务保持同步，中间不能await网络。不同请求并发只能有一个成功改变相同`turnId`。
 - 超时tick与玩家roll调用同一服务，使用deadline/turnId复核，不能重复轮转。非当前玩家的动作不得改变掷骰结果。
-- 每轮每个开局席位最多一次机会；开局随机的是起始位，不是每轮重新抽顺序。离开席位不删除历史，轮转跳过离开者；轮数仍按完整顺序边界计算。
-- 全员离线记下当前回合剩余毫秒并将deadline清空；第一位回来的玩家恢复deadline。服务器重启后先把所有连接状态置离线并暂停，不能立即把恢复前的所有回合判超时。
+- 每轮每个开局席位最多一次机会；开局随机的是起始位，不是每轮重新抽顺序。离开席位不删除历史，轮转跳过离开者；轮数仍按完整顺序边界计算。开局后只剩1位在席成员也能继续，不再因人数少于2人提前结束；全员主动离席时按未完成关闭并保留记录。
+- 收尾规则：普通五档全部发完且已经有人夺魁时记下`closingRound`（当前轮），收完这一整轮再结算；普通奖发空但还没有状元时继续轮转，不结束也不空转。固定轮数局到上限正常结束，剩余奖品照常展示；两种条件同时满足时按实际剩余奖品给出真实原因（奖品确实发完才报“奖品发完”）。
+- 状元唯一：持续顶状元版严格更大的成绩顶替领先者，同分先到先得；高阶锁定版在首次出现五红／六黑／遍地锦／六红／插金花时锁定得主，锁定后不再被更大牌型替换，但锁定只确定归属，不让整局提前结束，四红与五子阶段仍可争夺。状元配置的份数（可以大于1）在结算时全部发给唯一的最终状元，重复结算不会再次发放；离席的状元候选保留资格。
+- 全员离线记下当前回合剩余毫秒并将deadline清空；第一位回来的玩家恢复deadline并取消离线到期计时。服务器重启后先把所有连接状态置离线并暂停（已有离线起点原样保留，不顺延24小时），不能立即把恢复前的所有回合判超时。
 - 倒计时以服务端deadline为准，浏览器倒计时只显示；前端时钟误差不能授权掷骰。
 - socket断线时禁用掷骰；重连后拉快照。请求超时或响应丢失后，复用原requestId/expectedTurnId或直接同步状态，不能自动生成新请求造成多投。
 - 房主转交不重置回合、不清空奖池；断线60秒转交与主动离开转交分别有测试。

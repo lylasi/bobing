@@ -33,22 +33,22 @@
 | R02 | 四红带2+6与四红带3+5比较 | 同分，后到者不替换 |
 | R03 | 五个2带6与五个3带1比较 | 后者按本房规先比较相同点数胜出 |
 | R04 | 四进带两个4 | 只发四进，不发二举 |
-| G01 | 2人5轮，随机起始位 | 共10次机会，每人5次，无第11次 |
-| G02 | 12人20轮并含超时 | 每席位最多20次机会，历史最多240条 |
-| G03 | 最后一份普通奖在一轮中途领完 | 本轮余下成员仍有机会，下一轮不开始 |
+| G01 | 2人固定5轮，随机起始位 | 共10次机会，每人5次，无第11次 |
+| G02 | 12人固定20轮并含超时 | 每席位最多20次机会，历史最多240条；累计投掷/超时次数不受240条窗口影响 |
+| G03 | 最后一份普通奖在一轮中途领完（且已有状元） | 本轮余下成员仍有机会，下一轮不开始；普通奖领完但尚无状元时继续轮转 |
 | G04 | 普通奖库存0又中同奖 | 记录中奖牌型，awarded为空，不扣成负数 |
-| G05 | 更大状元、同分状元、无人状元 | 替换、保留、空缺；结束只发一次 |
+| G05 | 更大状元、同分状元、无人状元、状元配置3份 | 持续版替换／同分保留；锁定版首次高阶牌型即锁定且不再替换；无人则空缺；结算只发一次，份数全部归唯一状元 |
 | G06 | 同turnId双击/两个不同requestId并发 | 最多一条有效掷骰记录 |
 | G07 | 同requestId重试 | 返回已提交结果，不生成新骰子 |
 | G08 | roll与超时同时触发 | 一次机会只结算一次 |
-| G09 | 主动离开当前席位 | 不重新排列历史；正确交给下一席位或结算 |
+| G09 | 主动离开当前席位 | 不重新排列历史；正确交给下一席位；只剩1人仍可继续，全员离席按未完成关闭并保留记录 |
 | G10 | 再开局后发送旧局roll | 拒绝，不能投新局骰子 |
 | A01 | 无token/错误token/跨房token | 成员数据和操作被拒绝 |
 | A02 | 成员伪造start/end/rematch | HOST_ONLY，状态不变 |
 | A03 | 客户端发送dice和result | 不能影响服务器骰子/判奖 |
 | A04 | 客户端快照和广播 | 不含任何token、tokenHash或内部凭证 |
 | A05 | 同名、满房、开始后加入 | 对应明确中文提示，无重复玩家 |
-| A06 | 24h过期 | 410，不悄悄复用已过期房间 |
+| A06 | 24h过期 | 410，不悄悄复用已过期房间；等待室从创建起算，对局中有人在线不过期，全员离线从离线起点算，重连即取消，重启不顺延 |
 | S01 | 两个不同浏览器上下文 | 同样的骰子/奖池/history/revision |
 | S02 | 同成员两个Socket只断一个 | 仍在线，人数没有翻倍 |
 | S03 | 全员离线后推进时间 | 暂停，重连恢复剩余时间 |
@@ -70,4 +70,21 @@
 | D02 | 生产npm start | health、深链、Socket和静态资源可用 |
 | D03 | 部署文档 | 明确单实例、数据卷、HTTPS/WebSocket、访问范围 |
 
-开发侧实测写入`docs/verification.md`，主代理最终独立检查写入`docs/primary-final-verification.md`，每项以真实执行结果为准。
+## 可配置玩法验收（2026-09-26）
+
+可配置玩法的细项验收以 [Spec 第 8 节 A01–A20](superpowers/specs/2026-09-26-bobing-configurable-play.md) 为准，业务侧编号 A01–A16、A19–A20，A17–A18 与界面方案共同覆盖。自动化落点：
+
+| 编号 | 主要覆盖位置 |
+| --- | --- |
+| A01 默认配置、A08 非法配置、A09 内容与份数 | `tests/server.test.ts`「房间配置：创建、校验与公开快照」 |
+| A02 无限轮数、A16 累计次数 | `tests/game.test.ts`、`tests/server.test.ts`「无限轮数局…21 轮以上」、`tests/configurable-play.acceptance.test.ts` |
+| A03 收尾整轮、A04 最后一手顶替、A07 多份状元 | `tests/game.test.ts`「收尾（奖品发完结束）」、`tests/configurable-play.acceptance.test.ts` |
+| A05／A06 高阶锁定 | `tests/game.test.ts`「状元比较与锁定」 |
+| A10 改配置权限与原子性、A11 再开局 | `tests/server.test.ts`「等待室改配置」、`tests/game.test.ts`「再开一局重置」 |
+| A12／A13 离线与到期、归档 | `tests/server.test.ts`「离线计时与过期归档」「结束归档」 |
+| A14 单人继续、A15 固定轮数结束 | `tests/game.test.ts`「离开与人数」「轮转与轮数」、`tests/server.test.ts`、`tests/configurable-play.acceptance.test.ts` |
+| A09／A10／A11 配置展示、房主编辑与本机方案 | `tests/e2e/configuration.spec.ts`、`tests/templates.test.ts` |
+| A17／A18 本人音效、动画、失败与刷新 | `tests/e2e/dice.spec.ts`、`tests/templates.test.ts` |
+| A19 不兼得／不追缴、A20 旧 maxRounds 迁移 | `tests/game.test.ts`「奖池与发奖」、`tests/server.test.ts`、`tests/db.test.ts` |
+
+本轮实际命令、审查修复与最终截图见 [可配置玩法集成验收](configurable-play-verification.md)，每项以真实执行结果为准。旧版本的实测记录保留在 `docs/verification.md` 与 `docs/primary-final-verification.md`。

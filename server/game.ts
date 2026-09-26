@@ -1,9 +1,18 @@
 /**
- * 对局纯逻辑：开局、轮转、发奖、状元比较、超时跳过、结算、再开局重置。
+ * 对局纯逻辑：开局、轮转、发奖、状元争夺与锁定、收尾结算、超时跳过、再开局重置。
  *
  * 本文件只操作内部房间对象，不做 IO、不读时钟：`now` 由调用方传入，
  * 骰子由调用方（room-service）从 crypto.randomInt 得到后传入。
- * 服务层负责权限、幂等回执、持久化与广播。
+ * 服务层负责权限、幂等回执、持久化、广播与到期时间。
+ *
+ * 房规来自本房间保存的 `ruleset` 快照（开局时深拷贝，不随系统预设更新改判）：
+ *  - continuous（持续顶状元）：收尾结束前严格更大的成绩替换领先者，同分先到先得；
+ *  - high-tier-lock（高阶锁定）：首次出现锁定牌型后得主不可再被顶替，但整局不提前结束。
+ *
+ * 结束方式来自 `config.endCondition`：
+ *  - all-prizes（默认）：五档普通奖全空且已有状元候选才进入收尾 `closingRound`，
+ *    完成当前整轮后结算，不额外多打一轮；普通奖空但无人状元则继续轮转；
+ *  - rounds：达到所选上限后按轮数结算，剩余奖品与空缺照常展示，不冒称“奖品发完”。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -13,19 +22,30 @@ import {
   NORMAL_PRIZE_KEYS,
   RULES_VERSION,
   TURN_DURATION_MS,
-  clonePool,
   emptyAwards,
   evaluateDice,
   isBetterRank,
 } from '../shared/rules.js';
+import { poolFromConfig } from '../shared/room-config.js';
+import { shouldLockChampion, snapshotRuleset } from '../shared/rulesets.js';
 import type {
   Champion,
   DiceResult,
   FinishedReason,
   PrizeKey,
+  RoomConfig,
   RoomStatus,
   RollRecord,
+  RulesetSnapshot,
 } from '../shared/types.js';
+
+/** 未完成（不合格结束）的结束原因：主动中止、全员离席关闭、离线过期，以及旧版的“人数不足”。 */
+const INCOMPLETE_REASONS: ReadonlySet<FinishedReason> = new Set<FinishedReason>([
+  'host-ended',
+  'all-left',
+  'offline-expired',
+  'players-left',
+]);
 
 /** 内部玩家：比公共 `Player` 多出凭证哈希与最后可见时间，绝不整体进入公共快照。 */
 export interface InternalPlayer {
@@ -37,6 +57,10 @@ export interface InternalPlayer {
   left: boolean;
   awards: Record<PrizeKey, number>;
   best: DiceResult | null;
+  /** 本局累计投掷次数，独立于 240 条历史窗口。 */
+  rollCount: number;
+  /** 本局累计超时跳过次数，独立于 240 条历史窗口。 */
+  timeoutCount: number;
   tokenHash: string;
   lastSeenAt: number;
 }
@@ -46,7 +70,8 @@ export interface InternalRoom {
   code: string;
   name: string;
   maxPlayers: number;
-  maxRounds: 5 | 10 | 20;
+  config: RoomConfig;
+  ruleset: RulesetSnapshot;
   rulesVersion: typeof RULES_VERSION;
   status: RoomStatus;
   hostId: string;
@@ -59,11 +84,20 @@ export interface InternalRoom {
   deadline: number | null;
   paused: boolean;
   pool: Record<PrizeKey, number>;
+  /** 本局初始奖池（进度分母），来自本局 config，不随发放减少。 */
+  initialPool: Record<PrizeKey, number>;
   champion: Champion | null;
+  /** 已进入收尾的轮次；未进入收尾为 null。 */
+  closingRound: number | null;
+  /** 主动中止、全员离席关闭或离线过期导致的未完成。 */
+  incomplete: boolean;
+  /** 本次全员离线起点；有人在线时为 null（重启保留，不顺延）。 */
+  allOfflineSince: number | null;
   history: RollRecord[];
   finishedReason: FinishedReason | null;
   createdAt: number;
-  expiresAt: number;
+  /** 活跃对局为 null；全员离线起 24 小时，或其他状态转换起 24 小时。 */
+  expiresAt: number | null;
 
   // —— 仅服务端使用的内部字段 ——
   /** 开局时固定的轮转顺序（playerId），离开席位不重排。 */
@@ -71,8 +105,6 @@ export interface InternalRoom {
   turnIndex: number;
   /** 暂停时保留的当前回合剩余毫秒。 */
   pauseRemainingMs: number | null;
-  /** 普通奖领完后等待“完成当前整轮”的结算原因。 */
-  pendingFinish: FinishedReason | null;
   turnDurationMs: number;
   startedAt: number | null;
   finishedAt: number | null;
@@ -84,16 +116,20 @@ export interface CreateRoomSeed {
   code: string;
   name: string;
   maxPlayers: number;
-  maxRounds: 5 | 10 | 20;
+  /** 本房间选择的配置；ruleset／initialPool／pool 由它派生。 */
+  config: RoomConfig;
   hostId: string;
   hostNickname: string;
   hostTokenHash: string;
   now: number;
-  expiresAt: number;
+  /** 等待室为创建后 24 小时；活跃对局为 null。 */
+  expiresAt: number | null;
   turnDurationMs?: number;
 }
 
 export function createInternalRoom(seed: CreateRoomSeed): InternalRoom {
+  const config = structuredClone(seed.config);
+  const initialPool = poolFromConfig(config);
   const host: InternalPlayer = {
     id: seed.hostId,
     nickname: seed.hostNickname,
@@ -104,6 +140,8 @@ export function createInternalRoom(seed: CreateRoomSeed): InternalRoom {
     left: false,
     awards: emptyAwards(),
     best: null,
+    rollCount: 0,
+    timeoutCount: 0,
     tokenHash: seed.hostTokenHash,
     lastSeenAt: seed.now,
   };
@@ -111,7 +149,9 @@ export function createInternalRoom(seed: CreateRoomSeed): InternalRoom {
     code: seed.code,
     name: seed.name,
     maxPlayers: seed.maxPlayers,
-    maxRounds: seed.maxRounds,
+    config,
+    // 系统预设的深拷贝：本房间的判奖策略不随后续注册表变化而改变
+    ruleset: snapshotRuleset(config.rulesetId),
     rulesVersion: RULES_VERSION,
     status: 'waiting',
     hostId: host.id,
@@ -123,8 +163,12 @@ export function createInternalRoom(seed: CreateRoomSeed): InternalRoom {
     turnId: null,
     deadline: null,
     paused: false,
-    pool: clonePool(),
+    pool: { ...initialPool },
+    initialPool,
     champion: null,
+    closingRound: null,
+    incomplete: false,
+    allOfflineSince: null,
     history: [],
     finishedReason: null,
     createdAt: seed.now,
@@ -132,7 +176,6 @@ export function createInternalRoom(seed: CreateRoomSeed): InternalRoom {
     turnOrder: [],
     turnIndex: 0,
     pauseRemainingMs: null,
-    pendingFinish: null,
     turnDurationMs: seed.turnDurationMs ?? TURN_DURATION_MS,
     startedAt: null,
     finishedAt: null,
@@ -163,6 +206,11 @@ export function allActiveOffline(room: InternalRoom): boolean {
   return activePlayers(room).every((player) => !player.online);
 }
 
+/** 固定轮数模式的上限；奖品发完模式返回 null（无限轮数）。 */
+export function maxRoundsOf(room: InternalRoom): number | null {
+  return room.config.endCondition.mode === 'rounds' ? room.config.endCondition.maxRounds : null;
+}
+
 function beginTurn(room: InternalRoom, now: number, playerId: string): void {
   room.turnPlayerId = playerId;
   room.turnId = randomUUID();
@@ -179,6 +227,7 @@ function beginTurn(room: InternalRoom, now: number, playerId: string): void {
 /**
  * 开局：随机起始位（调用方传入 startOffset）之后按入座顺序循环。
  * 只由 room-service 在权限与准备校验之后调用。
+ * 本局状态（库存、状元、收尾、记录、累计统计、锁定）全部从 config 重建。
  */
 export function startGame(room: InternalRoom, now: number, startOffset: number): void {
   const seated = activePlayers(room);
@@ -189,23 +238,30 @@ export function startGame(room: InternalRoom, now: number, startOffset: number):
   room.turnIndex = 0;
   room.round = 1;
   room.status = 'playing';
-  room.pool = clonePool();
+  room.initialPool = poolFromConfig(room.config);
+  room.pool = { ...room.initialPool };
   room.champion = null;
+  room.closingRound = null;
+  room.incomplete = false;
+  room.allOfflineSince = null;
   room.history = [];
   room.finishedReason = null;
-  room.pendingFinish = null;
   room.startedAt = now;
   room.finishedAt = null;
   room.paused = false;
   room.pauseRemainingMs = null;
   room.hostOfflineSince = null;
+  // 活跃对局不受“创建后 24 小时”截断；全员离线时才另行计算
+  room.expiresAt = null;
   for (const player of room.players) {
     player.awards = emptyAwards();
     player.best = null;
+    player.rollCount = 0;
+    player.timeoutCount = 0;
   }
   const first = room.turnOrder[0];
   if (first === undefined) {
-    finishGame(room, 'players-left', now);
+    finishGame(room, 'all-left', now);
     return;
   }
   beginTurn(room, now, first);
@@ -222,9 +278,35 @@ function allNormalPrizesEmpty(room: InternalRoom): boolean {
   return NORMAL_PRIZE_KEYS.every((key) => room.pool[key] <= 0);
 }
 
+function cloneResult(result: DiceResult): DiceResult {
+  return { code: result.code, label: result.label, prize: result.prize, rankKey: [...result.rankKey] as DiceResult['rankKey'] };
+}
+
 /**
- * 发奖：普通奖先到先得，库存 0 时返回 null（不降级、不补发）。
- * 状元只登记候选与最佳成绩，奖在整局结束时发放，因此此处返回 null。
+ * 登记状元候选：唯一状元，只保留一份归属。
+ *  - 已有锁定得主：任何更大的牌型都不能顶替；
+ *  - 否则严格更大才顶替，同分先到先得；
+ *  - 新的归属者若掷出本房规的锁定牌型，立即锁定（不可再被顶替），但不结束整局。
+ */
+function registerChampion(room: InternalRoom, player: InternalPlayer, result: DiceResult, dice: readonly number[], now: number): void {
+  const current = room.champion;
+  if (current === null) {
+    room.champion = { playerId: player.id, result: cloneResult(result), dice: [...dice], at: now, locked: false, lockedBy: null };
+  } else if (!current.locked && isBetterRank(result.rankKey, current.result.rankKey)) {
+    room.champion = { playerId: player.id, result: cloneResult(result), dice: [...dice], at: now, locked: false, lockedBy: null };
+  } else {
+    return;
+  }
+  const champion = room.champion;
+  if (champion && shouldLockChampion(room.ruleset, champion.result)) {
+    champion.locked = true;
+    champion.lockedBy = champion.result.code;
+  }
+}
+
+/**
+ * 发奖：普通奖先到先得，库存 0 时返回 null（不降级、不补发、不追缴）。
+ * 状元只登记候选与最佳成绩，奖在整局结束时一次性发放，因此此处返回 null。
  */
 function awardPrize(room: InternalRoom, player: InternalPlayer, result: DiceResult, dice: readonly number[], now: number): PrizeKey | null {
   const prize = result.prize;
@@ -232,18 +314,15 @@ function awardPrize(room: InternalRoom, player: InternalPlayer, result: DiceResu
 
   if (prize === 'zhuangyuan') {
     if (player.best === null || isBetterRank(result.rankKey, player.best.rankKey)) {
-      player.best = result;
+      player.best = cloneResult(result);
     }
-    if (room.champion === null || isBetterRank(result.rankKey, room.champion.result.rankKey)) {
-      room.champion = { playerId: player.id, result, dice: [...dice], at: now };
-    }
+    registerChampion(room, player, result, dice, now);
     return null;
   }
 
   if (room.pool[prize] > 0) {
     room.pool[prize] -= 1;
     player.awards[prize] += 1;
-    if (allNormalPrizesEmpty(room)) room.pendingFinish = 'pool-empty';
     return prize;
   }
   return null;
@@ -251,12 +330,14 @@ function awardPrize(room: InternalRoom, player: InternalPlayer, result: DiceResu
 
 /**
  * 推进到下一个未离开席位。跨过顺序末尾即进入下一轮：
- * 轮数超过上限按 `round-limit` 结算；普通奖领完按 `pool-empty` 在整轮结束后结算。
+ *  - 已进入收尾（普通奖全空且已有状元候选）：本轮结束即按 `pool-empty` 结算，不多打一轮；
+ *  - 固定轮数模式达到上限：按 `round-limit` 结算，剩余奖品照常展示；
+ *  - 其余情况继续轮转；全员离席时按 `all-left` 关闭。
  */
 function advanceTurn(room: InternalRoom, now: number): void {
   const size = room.turnOrder.length;
   if (size === 0) {
-    finishGame(room, 'players-left', now);
+    finishGame(room, 'all-left', now);
     return;
   }
   let index = room.turnIndex;
@@ -266,12 +347,23 @@ function advanceTurn(room: InternalRoom, now: number): void {
     if (index >= size) {
       index = 0;
       round += 1;
-      if (round > room.maxRounds) {
-        finishGame(room, 'round-limit', now);
+      // 全员已离席时，这一轮边界不构成“正常结算”：按未完成关闭，不制造奖品发完的结果
+      if (activePlayers(room).length === 0) {
+        finishGame(room, 'all-left', now);
         return;
       }
-      if (room.pendingFinish !== null) {
-        finishGame(room, room.pendingFinish, now);
+      // 再判“奖品发完”收尾：必须同时满足普通奖已发空且已经有人夺魁，
+      // 同时触达轮数上限时，结束原因必须与实际剩余奖品一致
+      const allNormalEmpty = NORMAL_PRIZE_KEYS.every((key) => room.pool[key] === 0);
+      if (room.closingRound !== null && room.champion !== null && allNormalEmpty) {
+        finishGame(room, 'pool-empty', now);
+        return;
+      }
+      // 收尾条件不再成立（例如旧数据的残留标记）：清掉收尾轮次，避免之后误判
+      if (room.closingRound !== null) room.closingRound = null;
+      const maxRounds = maxRoundsOf(room);
+      if (maxRounds !== null && round > maxRounds) {
+        finishGame(room, 'round-limit', now);
         return;
       }
     }
@@ -285,7 +377,7 @@ function advanceTurn(room: InternalRoom, now: number): void {
       return;
     }
   }
-  finishGame(room, 'players-left', now);
+  finishGame(room, 'all-left', now);
 }
 
 /**
@@ -300,7 +392,12 @@ export function applyRoll(room: InternalRoom, playerId: string, dice: readonly n
   if (turnId === null) throw new Error('当前没有进行中的回合');
 
   const result = evaluateDice(dice);
+  player.rollCount += 1;
   const awarded = awardPrize(room, player, result, dice, now);
+  // 收尾条件：五档普通奖全空且已有状元候选（状元库存此时必定未发，不能当作空仓依据）
+  if (room.closingRound === null && room.champion !== null && allNormalPrizesEmpty(room)) {
+    room.closingRound = room.round;
+  }
   const record: RollRecord = {
     id: randomUUID(),
     playerId,
@@ -320,7 +417,7 @@ export function applyRoll(room: InternalRoom, playerId: string, dice: readonly n
 }
 
 /**
- * 30 秒超时：记一条“超时跳过”，不掷骰、不发奖，消耗一次机会。
+ * 30 秒超时：记一条“超时跳过”，不掷骰、不发奖，消耗一次机会并累计 timeoutCount。
  * 幂等：deadline 已过但回合已经推进时返回 false，不会重复轮转。
  */
 export function skipExpiredTurn(room: InternalRoom, now: number): boolean {
@@ -330,6 +427,7 @@ export function skipExpiredTurn(room: InternalRoom, now: number): boolean {
   if (now < room.deadline) return false;
 
   const player = findPlayer(room, room.turnPlayerId);
+  if (player) player.timeoutCount += 1;
   const record: RollRecord = {
     id: randomUUID(),
     playerId: room.turnPlayerId,
@@ -350,19 +448,25 @@ export function skipExpiredTurn(room: InternalRoom, now: number): boolean {
 
 /**
  * 结算：幂等，重复调用不重复发状元。
- * 有领先者时把状元 1 份发给他；无人夺魁则状元库存保留 1。
+ * 有领先者/锁定得主时把状元档剩余的全部份数一次性发给他；无人夺魁则状元空缺、库存保留。
+ * 找不到得主属于状态损坏，先抛错而不是悄悄丢奖。
  */
 export function finishGame(room: InternalRoom, reason: FinishedReason, now: number): void {
   if (room.status === 'finished' || room.status === 'closed') return;
 
-  if (room.champion !== null && room.pool.zhuangyuan > 0) {
+  if (room.champion !== null) {
     const champion = findPlayer(room, room.champion.playerId);
-    room.pool.zhuangyuan -= 1;
-    if (champion) champion.awards.zhuangyuan += 1;
+    if (!champion) throw new Error(`状元玩家不在房间内：${room.champion.playerId}`);
+    const portions = room.pool.zhuangyuan;
+    if (portions > 0) {
+      champion.awards.zhuangyuan += portions;
+      room.pool.zhuangyuan = 0;
+    }
   }
 
-  room.status = 'finished';
+  room.status = reason === 'all-left' ? 'closed' : 'finished';
   room.finishedReason = reason;
+  room.incomplete = INCOMPLETE_REASONS.has(reason);
   room.deadline = null;
   room.paused = false;
   room.pauseRemainingMs = null;
@@ -415,7 +519,8 @@ export function transferHost(
 
 /**
  * 再开一局：归档由服务层完成，这里只做状态重置。
- * 房码与身份保留、离开者清理、奖品与本局记录重置、非房主准备取消、局编号加 1。
+ * 沿用本房间配置（房规、奖品、结束方式），重置库存/锁定/收尾/记录/累计统计，
+ * 房码与身份保留、离开者清理、非房主准备取消、局编号加 1。
  */
 export function prepareRematch(room: InternalRoom, now: number): void {
   room.players = room.players.filter((player) => !player.left).sort((a, b) => a.seat - b.seat);
@@ -425,6 +530,8 @@ export function prepareRematch(room: InternalRoom, now: number): void {
   for (const player of room.players) {
     player.awards = emptyAwards();
     player.best = null;
+    player.rollCount = 0;
+    player.timeoutCount = 0;
     player.ready = player.id === room.hostId;
   }
   room.gameNumber += 1;
@@ -435,11 +542,14 @@ export function prepareRematch(room: InternalRoom, now: number): void {
   room.deadline = null;
   room.paused = false;
   room.pauseRemainingMs = null;
-  room.pool = clonePool();
+  room.initialPool = poolFromConfig(room.config);
+  room.pool = { ...room.initialPool };
   room.champion = null;
+  room.closingRound = null;
+  room.incomplete = false;
+  room.allOfflineSince = null;
   room.history = [];
   room.finishedReason = null;
-  room.pendingFinish = null;
   room.turnOrder = [];
   room.turnIndex = 0;
   room.startedAt = null;

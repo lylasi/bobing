@@ -1,14 +1,15 @@
 /**
- * 邀请落地页：先读房间概况，再输入昵称加入。
+ * 邀请落地页：先读房间真实概况（含系统房规、结束方式、奖品配置），再输入昵称加入。
  * 已开局 / 已结束 / 已满 / 已过期 / 不存在都给出对应说明与回首页入口，
  * 不会静默新建一个本地房间。
  */
 
 import { useCallback, useEffect, useId, useState } from 'react';
 import type { FormEvent, ReactElement } from 'react';
-import { NICKNAME_MAX_LENGTH } from '../../shared/rules.js';
+import { NICKNAME_MAX_LENGTH, PRIZE_KEYS, PRIZE_META } from '../../shared/rules.js';
 import type { Membership, RoomPreview } from '../../shared/types.js';
 import { ApiError, describeError, joinRoom, previewRoom } from '../lib/api.js';
+import { endConditionLabel, totalConfiguredPrizes } from '../lib/format.js';
 import { Link, navigate } from '../lib/router.js';
 import { saveMembership } from '../lib/session.js';
 import { Bowl } from './Bowl.js';
@@ -76,7 +77,6 @@ export function RoomLanding({ code, notice, onJoined }: RoomLandingProps): React
       onJoined(joined.membership);
     } catch (error) {
       setFormError(describeError(error));
-      // 满员/开局等失败后刷新概况，保证页面信息与服务器一致
       void loadPreview();
     } finally {
       setSubmitting(false);
@@ -130,14 +130,32 @@ export function RoomLanding({ code, notice, onJoined }: RoomLandingProps): React
                 </dd>
               </div>
               <div>
-                <dt>每人轮数</dt>
-                <dd>{preview.maxRounds} 轮</dd>
+                <dt>结束方式</dt>
+                <dd>{endConditionLabel(preview.config.endCondition)}</dd>
               </div>
               <div>
-                <dt>房规</dt>
-                <dd>线上统一房规 v1</dd>
+                <dt>系统房规</dt>
+                <dd>{preview.ruleset.name}</dd>
               </div>
             </dl>
+
+            <div className="landing-prizes">
+              <p className="field-label">
+                本局奖品（共 {totalConfiguredPrizes(preview.config.prizes)} 份）
+              </p>
+              <ul className="waiting-prize-list">
+                {PRIZE_KEYS.map((key) => {
+                  const prize = preview.config.prizes[key];
+                  return (
+                    <li key={key} className="waiting-prize-item">
+                      <span className="waiting-prize-name">{PRIZE_META[key].label}</span>
+                      <span className="waiting-prize-count">{prize.count} 份</span>
+                      {prize.content !== '' ? <span className="prize-content">{prize.content}</span> : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
 
             {blocked ? (
               <>

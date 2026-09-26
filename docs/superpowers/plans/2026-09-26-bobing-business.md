@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **用户指定的执行方式优先：**业务由 codeg-mcp delegate_to_agent 的 deepseek 执行，UI 由 pi 执行；不得按通用技能头改派其他代理。整体需求确认前只评审本计划。当前目录没有 Git 仓库，不初始化仓库、不执行 git commit。
+> **用户指定的执行方式优先：**业务由 codeg-mcp delegate_to_agent 的 deepseek 执行，UI 由 pi 执行；不得按通用技能头改派其他代理。用户已确认整体需求并授权开发。Git 基线已建立，在 feat/configurable-play 独立工作区实施；Git 提交与集成由主代理负责，受托代理不要另建分支或提交。
 
 **Goal:** 实现默认奖品发完结束、两种状元策略、可配置奖池以及离线过期归档，并为 Pi 提供稳定契约。
 
@@ -50,7 +50,7 @@ DeepSeek 不改 src 或 tests/e2e；Pi 不改 shared、server 或业务测试。
 
 **Interfaces:** 按 Spec 第 10 节落实 RoomConfig、EndCondition、RulesetSnapshot、createDefaultRoomConfig、normalizeRoomConfig、poolFromConfig、snapshotRuleset、shouldLockChampion。保留 PrizeKey、DiceResult 与基础规则分类。
 
-- [ ] **Step 1: 添加配置与策略测试。**
+- [x] **Step 1: 添加配置与策略测试。**
 
 在 tests/room-config.test.ts 使用以下实际行为断言：
 
@@ -92,11 +92,12 @@ describe('可配置房规', () => {
 
 基础判奖函数已核对为 shared/rules.ts 的 evaluateDice，直接复用。
 
-- [ ] **Step 2: 运行新测试确认缺失的配置能力。**
+- [x] **Step 2: 运行新测试确认缺失的配置能力。**
 
 Run: npm test -- tests/room-config.test.ts。Expected: 新模块尚未实现导致失败；不得把现有 V1 判奖行为改成预期外的新规则。
+（本阶段先完成实现再补做失败复核：临时移走 shared/room-config.ts、shared/rulesets.ts 后该用例以 "Cannot find module '../shared/room-config.js'" 失败，随即将两个文件移回。）
 
-- [ ] **Step 3: 实现契约与注册表。**
+- [x] **Step 3: 实现契约与注册表。**
 
 系统注册表中的策略数据为：
 
@@ -122,13 +123,14 @@ export function shouldLockChampion(ruleset: RulesetSnapshot, result: DiceResult)
 
 normalizeRoomConfig 必须先验证输入是非数组对象、规则 ID 在注册表中、结束方式是判别联合、rounds 模式只有 5／10／20、六档齐全、份数为正安全整数、content 为字符串。只返回允许字段的深拷贝，content 去首尾空格，合计必须是安全整数。不得信任请求传入的规则快照、锁定列表或比较键。poolFromConfig 只读取本局 prizes 的 count。DEFAULT 数量保留单一数据来源，避免 PRIZE_META 和 INITIAL_POOL 分别漂移。
 
-- [ ] **Step 4: 补齐锁定牌型与输入边界。**
+- [x] **Step 4: 补齐锁定牌型与输入边界。**
 
 用六红 [4,4,4,4,4,4]、遍地锦 [1,1,1,1,1,1]、六黑 [2,2,2,2,2,2]、插金花 [4,4,4,4,1,1] 验证可锁；四红 [4,4,4,4,2,6] 与五子 [2,2,2,2,2,4] 不锁。验证缺档、字符串份数、非字符串内容和超出安全整数的合计均拒绝。保留既有穷举判奖测试。
 
-- [ ] **Step 5: 验证并交付契约。**
+- [x] **Step 5: 验证并交付契约。**
 
 Run: npm test -- tests/room-config.test.ts tests/rules.test.ts。通过后向主代理列出实际导出名、DTO 字段和任何与 Spec 的差异；主代理确认后，Pi 可以开始其计划。此阶段整体 typecheck 可能仍受尚未迁移的旧调用点影响，不宣称整项目已通过。
+（实际结果：2 个文件 84 个用例全部通过；`npm test` 全套 6 个文件 161 个用例仍全部通过；`npm run typecheck` 有 12 处错误，全部位于尚未迁移的 server/**、src/**、tests/server.test.ts。）
 
 ## Task 2: 新建、等待室配置与旧数据恢复
 
@@ -136,7 +138,7 @@ Run: npm test -- tests/room-config.test.ts tests/rules.test.ts。通过后向主
 
 **Interfaces:** 创建入口接受 config；旧 maxRounds 请求适配为 rounds 模式；Action 增加 update-config；RoomPreview 和 toPublicRoom 输出 Spec 第 10 节字段。normalizeStoredRoom(value: unknown): InternalRoom 负责旧快照恢复。
 
-- [ ] **Step 1: 用真实 HTTP 验证新配置能到达房间快照。**
+- [x] **Step 1: 用真实 HTTP 验证新配置能到达房间快照。**
 
 在 tests/server.test.ts 现有 startServer 工具作用域内添加：
 
@@ -157,7 +159,7 @@ it('新建无限轮数房间公开真实奖品配置', async () => {
 });
 ~~~
 
-- [ ] **Step 2: 运行失败用例，再实现创建与更新入口。**
+- [x] **Step 2: 运行失败用例，再实现创建与更新入口。**
 
 Run: npm test -- tests/server.test.ts -t '新建无限轮数房间'。
 
@@ -180,7 +182,7 @@ const config = raw.config !== undefined
 
 将配置验证异常映射到 INVALID_INPUT。createInternalRoom 接收 config，生成独立的 ruleset、initialPool 和 pool。update-config 在认证后的现有同步事务中验证房主、waiting 状态和完整配置；配置实际变化才替换配置及满额库存、清除其他在席玩家 ready，房主 ready 保持原值。修改失败不落盘、不广播。开局、更新、投掷不能在同一事务中 await。
 
-- [ ] **Step 3: 实现旧快照归一化，不修改历史选择。**
+- [x] **Step 3: 实现旧快照归一化，不修改历史选择。**
 
 normalizeStoredRoom 仅对未升级快照采用原 maxRounds、默认六档数量、空 content、continuous 规则。旧 champion 增加 locked=false、lockedBy=null；旧玩家次数按仍完整的旧局记录重建；新增 closingRound、allOfflineSince、incomplete 有明确初值。迁移后的配置在 loadRoom 返回前验证；新配置缺字段不能套用“旧数据默认值”掩盖损坏。初始奖池来自配置，不能拿剩余库存当初始数量。
 
@@ -195,11 +197,11 @@ const legacyConfig = normalizeRoomConfig({
 // 新快照已有 config 时走新结构校验，不执行上述旧数据分支。
 ~~~
 
-- [ ] **Step 4: 加入权限、原子性与兼容性测试。**
+- [x] **Step 4: 加入权限、原子性与兼容性测试。**
 
 继续使用 tests/server.test.ts 已有 startServer、connectSocket 和状态等待工具。两人入席且准备后：房主 update-config 成功，另一人的 ready=false；非房主请求为 HOST_ONLY；开局后请求为 INVALID_STATE；六档任一非法值为 INVALID_INPUT 且 revision、库存与 ready 均未改变。另验证旧 maxRounds=5 请求仍得到 rounds 模式、邀请概况包含新配置、快照不泄漏 token 或 tokenHash。
 
-- [ ] **Step 5: 聚焦验证。**
+- [x] **Step 5: 聚焦验证。**
 
 Run: npm test -- tests/server.test.ts tests/room-config.test.ts。记录新增断言覆盖 A01、A08–A11、A20。全套业务状态机迁移在下一任务完成。
 
@@ -209,7 +211,7 @@ Run: npm test -- tests/server.test.ts tests/room-config.test.ts。记录新增�
 
 **Interfaces:** 沿用 startGame、applyRoll、skipExpiredTurn、finishGame、prepareRematch；InternalRoom 持有 RoomState 的新配置和字段，Player 独立存储 rollCount／timeoutCount。
 
-- [ ] **Step 1: 扩展现有 makeRoom 测试夹具，添加配置场景。**
+- [x] **Step 1: 扩展现有 makeRoom 测试夹具，添加配置场景。**
 
 现有 makeRoom 增加可选 config 参数。没有提供 config 时，把 overrides.maxRounds 或原默认 5 转成 rounds 配置，再把 config 传给 createInternalRoom，不再传旧顶层 maxRounds；手工加入的 InternalPlayer 初始化两个累计次数为 0。以下 helper 放在同一 tests/game.test.ts 中，其他测试继续复用原 makeRoom：
 
@@ -244,7 +246,7 @@ it('普通奖空缺状元时继续，产生状元后收完当轮并发全部状�
 });
 ~~~
 
-- [ ] **Step 2: 增加锁定和长局测试并观察失败。**
+- [x] **Step 2: 增加锁定和长局测试并观察失败。**
 
 ~~~ts
 it('五红锁定后插金花不能换人，普通奖未空仍继续', () => {
@@ -271,7 +273,7 @@ it('超过记录窗口和旧轮数上限仍保存累计次数', () => {
 
 Run: npm test -- tests/game.test.ts。原先断言“少于两人自动结束”的用例应改为“仅剩一人继续”，保留零在席关闭场景。
 
-- [ ] **Step 3: 修改状态机核心。**
+- [x] **Step 3: 修改状态机核心。**
 
 每次真实投掷：更新个人 best 与 rollCount；只在 champion 未锁且成绩严格更好时更新领先者，然后根据房间 ruleset 判断是否锁定。普通奖每次最多扣一份。每次投掷完成所有发奖与状元更新之后统一检查：
 
@@ -285,11 +287,11 @@ if (readyToClose && room.closingRound === null) room.closingRound = room.round;
 
 skipExpiredTurn 只增加 timeoutCount，不发奖。startGame 和 prepareRematch 从 config.prizes 重建初始奖池及剩余库存，清零个人统计、锁定、收尾、历史和 incomplete。服务层和游戏层所有“少于两人”自动结束分支统一调整，开局的至少两人要求保持。incomplete 只标记中止、全部离席或离线过期；固定轮数正常到期显示剩余库存，不冒称未完成。
 
-- [ ] **Step 4: 验证剩余状态转换。**
+- [x] **Step 4: 验证剩余状态转换。**
 
 用明确骰子增加：四红→五子→五红锁定；持续版五红被插金花顶替；同分不替换；状元得主离席保留资格；当轮最后一人出现状元即完成收尾；房主中止可结算已有候选但普通奖保持剩余；固定 5 轮无状元时按上限结束；再开局沿用配置且不保留 locked／closingRound／统计。
 
-- [ ] **Step 5: 验证业务层。**
+- [x] **Step 5: 验证业务层。**
 
 Run: npm test -- tests/game.test.ts tests/rules.test.ts tests/room-config.test.ts。覆盖 A02–A07、A14–A16、A19–A20；不得用概率等待稀有牌型替代确定性测试。
 
@@ -299,7 +301,7 @@ Run: npm test -- tests/game.test.ts tests/rules.test.ts tests/room-config.test.t
 
 **Interfaces:** RoomRow.expiresAt 改为 number|null；AppDatabase 增加 saveArchive(row: ArchiveRow): void、listArchives(code: string, roomCreatedAt: number): ArchiveRow[]。ArchiveRow 包含 code、roomCreatedAt、gameNumber、stateJson、archivedAt、reason、incomplete，stateJson 只保存公共快照。
 
-- [ ] **Step 1: 添加不依赖真实等待的数据库回归。**
+- [x] **Step 1: 添加不依赖真实等待的数据库回归。**
 
 ~~~ts
 import { expect, it } from 'vitest';
@@ -323,7 +325,7 @@ it('活跃房间无到期时间，删除房间不删除独立归档', () => {
 
 Run: npm test -- tests/db.test.ts。先验证旧 schema 拒绝 NULL 或没有归档能力，再实现。
 
-- [ ] **Step 2: 迁移到期字段并新增独立归档。**
+- [x] **Step 2: 迁移到期字段并新增独立归档。**
 
 现有 rooms.expires_at 为 NOT NULL，需要版本化事务迁移，不可只修改 CREATE TABLE IF NOT EXISTS。检查 PRAGMA table_info(rooms)，必要时重建 rooms 表、拷贝全部旧行、重建索引；在首次准备查询语句前完成。新的加载和清理 SQL 为：
 
@@ -348,7 +350,7 @@ CREATE TABLE IF NOT EXISTS room_archives (
 
 归档主键包含创建时间，避免墓碑清理后旧房码复用覆盖旧记录。现有 db.deleteRoom 会手动删除 completed_games；先将旧 completed_games 的快照迁入独立归档，之后正常完成、中止、零人关闭和离线过期都写入同一归档机制。删除临时房间与 receipts 不得删除 room_archives。不新增公开历史查询接口。
 
-- [ ] **Step 3: 把 presence 转换与过期处理放进事务。**
+- [x] **Step 3: 把 presence 转换与过期处理放进事务。**
 
 playing 且至少一位在席成员在线时 allOfflineSince=null、expiresAt=null。首次从有人在线转为全员离线时：
 
@@ -362,13 +364,13 @@ room.expiresAt = room.allOfflineSince + this.roomTtlMs;
 
 purgeExpiredRoom 必须先在一个事务中生成未完成公共快照、保存归档、删除临时记录、写过期墓碑；事务成功后才移除进程缓存、presence 和通知客户端。离线过期不能调用会补发状元的普通 finishGame 路径。
 
-- [ ] **Step 4: 覆盖计时和迁移行为。**
+- [x] **Step 4: 覆盖计时和迁移行为。**
 
 使用 tests/server.test.ts 的 ClockBox、startServer、connectSocket 与 instance.service.tick 可注入时钟能力，检验：活跃超过创建后 24 小时；离线 23 小时回来；再次离线新起点；离线中重启不顺延；到期 410 且 archive 有原已发记录和 incomplete=true；空期限房间能被 onBoot 载入；多连接只在最后一个断开才进入全员离线状态。
 
 另用临时 SQLite 文件建立原 NOT NULL schema 和旧固定轮数快照，重开 AppDatabase 后验证行、回执和原轮数未丢失，二次迁移幂等；旧 completed_games 在房间清理后仍可从新归档读取。
 
-- [ ] **Step 5: 聚焦验证。**
+- [x] **Step 5: 聚焦验证。**
 
 Run: npm test -- tests/db.test.ts tests/server.test.ts。通过后 Run: npm run build:server。对应 A12–A14、A20。
 
@@ -378,8 +380,8 @@ Run: npm test -- tests/db.test.ts tests/server.test.ts。通过后 Run: npm run 
 
 **Interfaces:** 向 Pi 和主代理交付符合 Spec 第 10 节的真实字段；业务文档描述两种系统方案、两种结束方式与明确的迁移行为。
 
-- [ ] 搜索旧前提，修正本次变更相关的文档：固定 10 轮默认、总奖池固定 63、状元只发 1、少于两人结束、创建后固定 24 小时、历史只有 240 次机会。
-- [ ] 运行 npm test 和 npm run build:server，提供实际结果；不要把旧文档的测试数量当成本次结果。
-- [ ] 与 Pi 完成字段衔接后，由主代理运行 npm run typecheck、npm test、npm run build 和 npm run test:e2e；仅因新失败或新增修改才扩大或重复测试。
-- [ ] 逐项核对 Spec 的 A01–A20：业务负责编号 A01–A16、A19–A20，A17–A18 与 UI 计划共同覆盖。
-- [ ] 交付实际修改文件、测试结果和仍存在的限制；所有“已完成”以检查通过为准，不部署或发布未验收状态。
+- [x] 搜索旧前提，修正本次变更相关的文档：固定 10 轮默认、总奖池固定 63、状元只发 1、少于两人结束、创建后固定 24 小时、历史只有 240 次机会。
+- [x] 运行 npm test 和 npm run build:server，提供实际结果；不要把旧文档的测试数量当成本次结果。
+- [x] 与 Pi 完成字段衔接后，主代理运行 npm run typecheck、npm test（230 项通过）和 npm run test:e2e（启动器先执行 npm run build；24 项通过）；仅因新失败或新增修改才扩大或重复测试。
+- [x] 逐项核对 Spec 的 A01–A20：业务负责编号 A01–A16、A19–A20，A17–A18 与 UI 计划共同覆盖。
+- [x] 交付实际修改文件、测试结果和仍存在的限制；所有“已完成”以检查通过为准，不部署或发布未验收状态。

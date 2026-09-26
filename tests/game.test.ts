@@ -7,6 +7,7 @@ import {
   findPlayer,
   finishGame,
   isValidDice,
+  maxRoundsOf,
   pauseRoom,
   prepareRematch,
   resumeRoom,
@@ -15,10 +16,14 @@ import {
   transferHost,
 } from '../server/game.js';
 import type { InternalPlayer, InternalRoom } from '../server/game.js';
-import { emptyAwards } from '../shared/rules.js';
+import { NORMAL_PRIZE_KEYS, emptyAwards } from '../shared/rules.js';
+import { createDefaultRoomConfig, poolFromConfig } from '../shared/room-config.js';
+import { snapshotRuleset } from '../shared/rulesets.js';
+import type { RoomConfig } from '../shared/types.js';
 
 const T0 = 1_800_000_000_000;
 const TURN_MS = 30_000;
+const DAY_MS = 24 * 3600 * 1000;
 
 // 判奖样例骰子（与 rules.test.ts 相同来源）
 const NONE = [1, 1, 2, 2, 3, 3];
@@ -27,20 +32,31 @@ const ERJU = [4, 4, 1, 2, 3, 5];
 const SIJIN = [2, 2, 2, 2, 4, 4];
 const DUITANG = [1, 2, 3, 4, 5, 6];
 const SIHONG = [4, 4, 4, 4, 2, 6];
+const WUZI = [2, 2, 2, 2, 2, 4];
 const WUHONG = [4, 4, 4, 4, 4, 6];
+const LIUHE = [6, 6, 6, 6, 6, 6];
 const CHAJINHUA = [4, 4, 4, 4, 1, 1];
 
-function makeRoom(playerCount = 2, overrides: { maxRounds?: 5 | 10 | 20; maxPlayers?: number; turnDurationMs?: number } = {}): InternalRoom {
+/** 旧客户端 maxRounds 请求的等价配置，供未关心结束方式的用例复用。 */
+function roundsConfig(maxRounds: 5 | 10 | 20): RoomConfig {
+  return { ...createDefaultRoomConfig(), endCondition: { mode: 'rounds', maxRounds } };
+}
+
+function makeRoom(
+  playerCount = 2,
+  overrides: { maxRounds?: 5 | 10 | 20; config?: RoomConfig; maxPlayers?: number; turnDurationMs?: number } = {},
+): InternalRoom {
+  const config = overrides.config ?? roundsConfig(overrides.maxRounds ?? 5);
   const room = createInternalRoom({
     code: 'ABCDEF',
     name: '中秋团圆局',
     maxPlayers: overrides.maxPlayers ?? Math.max(2, playerCount),
-    maxRounds: overrides.maxRounds ?? 5,
+    config,
     hostId: 'p0',
     hostNickname: '玩家0',
     hostTokenHash: 'hash-0',
     now: T0,
-    expiresAt: T0 + 24 * 3600 * 1000,
+    expiresAt: T0 + DAY_MS,
     turnDurationMs: overrides.turnDurationMs ?? TURN_MS,
   });
   for (let i = 1; i < playerCount; i++) {
@@ -53,12 +69,19 @@ function makeRoom(playerCount = 2, overrides: { maxRounds?: 5 | 10 | 20; maxPlay
       left: false,
       awards: emptyAwards(),
       best: null,
+      rollCount: 0,
+      timeoutCount: 0,
       tokenHash: `hash-${i}`,
       lastSeenAt: T0,
     });
   }
   for (const player of room.players) player.online = true;
   return room;
+}
+
+/** 指定配置的房间：ruleset／initialPool／pool 全部由 config 派生。 */
+function configuredRoom(playerCount: number, config: RoomConfig = createDefaultRoomConfig()): InternalRoom {
+  return makeRoom(playerCount, { config });
 }
 
 function player(room: InternalRoom, id: string): InternalPlayer {
@@ -71,6 +94,10 @@ function currentPlayerId(room: InternalRoom): string {
   const id = room.turnPlayerId;
   if (id === null) throw new Error('当前没有回合玩家');
   return id;
+}
+
+function lockConfig(): RoomConfig {
+  return { ...createDefaultRoomConfig(), rulesetId: 'high-tier-lock' };
 }
 
 describe('startGame 开局', () => {
@@ -86,19 +113,34 @@ describe('startGame 开局', () => {
     expect(room2.turnPlayerId).toBe('p2');
   });
 
-  it('开局状态：playing、第 1 轮、UUID turnId、30 秒 deadline、满额奖池', () => {
-    const room = makeRoom(2);
+  it('开局状态：playing、第 1 轮、UUID turnId、30 秒 deadline、按 config 满额奖池', () => {
+    const config = createDefaultRoomConfig();
+    config.prizes.yixiu = { count: 7, content: '月饼一盒' };
+    const room = configuredRoom(2, config);
     startGame(room, T0, 0);
     expect(room.status).toBe('playing');
     expect(room.round).toBe(1);
     expect(room.turnId).toMatch(/^[0-9a-f-]{36}$/i);
     expect(room.deadline).toBe(T0 + TURN_MS);
-    expect(room.pool).toEqual({ zhuangyuan: 1, duitang: 2, sanhong: 4, sijin: 8, erju: 16, yixiu: 32 });
+    expect(room.pool).toEqual({ zhuangyuan: 1, duitang: 2, sanhong: 4, sijin: 8, erju: 16, yixiu: 7 });
+    expect(room.initialPool.yixiu).toBe(7);
     expect(room.history).toEqual([]);
     expect(room.champion).toBeNull();
+    expect(room.closingRound).toBeNull();
+    expect(room.incomplete).toBe(false);
+    expect(room.ruleset.name).toBe('持续顶状元');
   });
 
-  it('从等待区带旧数据开局时清空上一局记录与奖项', () => {
+  it('活跃对局的到期时间为 null，不受创建后 24 小时截断', () => {
+    const room = makeRoom(2);
+    expect(room.expiresAt).toBe(T0 + DAY_MS);
+    startGame(room, T0, 0);
+    expect(room.expiresAt).toBeNull();
+    applyRoll(room, 'p0', NONE, T0 + 1);
+    expect(room.expiresAt).toBeNull();
+  });
+
+  it('从等待区带旧数据开局时清空上一局记录、奖项与累计统计', () => {
     const room = makeRoom(2);
     room.history.push({
       id: 'old',
@@ -114,16 +156,20 @@ describe('startGame 开局', () => {
     });
     room.players[0].awards.duitang = 1;
     room.players[0].best = { code: 'yixiu', label: '一秀', prize: 'yixiu', rankKey: [1, 0, 0] };
+    room.players[0].rollCount = 9;
+    room.players[0].timeoutCount = 3;
     room.pool.duitang = 1;
     startGame(room, T0, 0);
     expect(room.history).toEqual([]);
     expect(room.players[0].awards.duitang).toBe(0);
     expect(room.players[0].best).toBeNull();
+    expect(room.players[0].rollCount).toBe(0);
+    expect(room.players[0].timeoutCount).toBe(0);
     expect(room.pool.duitang).toBe(2);
   });
 });
 
-describe('轮转与轮数上限', () => {
+describe('轮转与结束方式', () => {
   it('2 人 5 轮：每人每轮恰好一次机会，第 10 手后按轮数上限结算', () => {
     const room = makeRoom(2, { maxRounds: 5 });
     startGame(room, T0, 0);
@@ -136,11 +182,33 @@ describe('轮转与轮数上限', () => {
     expect(room.history).toHaveLength(10);
     expect(room.status).toBe('finished');
     expect(room.finishedReason).toBe('round-limit');
+    expect(room.incomplete).toBe(false);
     expect(room.round).toBe(5); // 第 6 轮从未开始，round 停在最后一轮
     expect(room.deadline).toBeNull();
   });
 
-  it('12 人 20 轮最多 240 条记录，不超过历史上限', () => {
+  it('固定轮数达到上限时剩余奖品与空缺照常保留，不冒称奖品发完', () => {
+    const room = makeRoom(2, { maxRounds: 5 });
+    startGame(room, T0, 0);
+    for (let i = 0; i < 10; i++) applyRoll(room, currentPlayerId(room), YIXIU, T0 + i);
+    expect(room.status).toBe('finished');
+    expect(room.finishedReason).toBe('round-limit');
+    expect(room.incomplete).toBe(false);
+    expect(room.champion).toBeNull();
+    expect(room.pool.zhuangyuan).toBe(1); // 无人夺魁，状元空缺
+    expect(room.pool.yixiu).toBe(22); // 32 份发出 10 份，剩余照常展示
+  });
+
+  it('无限轮数：连续 300 手仍在进行，远超旧 20 轮上限', () => {
+    const room = configuredRoom(2);
+    startGame(room, T0, 0);
+    for (let i = 0; i < 300; i++) applyRoll(room, currentPlayerId(room), NONE, T0 + i);
+    expect(room.status).toBe('playing');
+    expect(room.round).toBe(151);
+    expect(room.champion).toBeNull();
+  });
+
+  it('12 人 20 轮最多 240 条记录，不超过历史上限，累计投掷独立保存', () => {
     const room = makeRoom(12, { maxRounds: 20 });
     startGame(room, T0, 0);
     for (let i = 0; i < 240; i++) applyRoll(room, currentPlayerId(room), NONE, T0 + i);
@@ -148,6 +216,23 @@ describe('轮转与轮数上限', () => {
     expect(room.status).toBe('finished');
     expect(room.finishedReason).toBe('round-limit');
     expect(new Set(room.history.map((record) => record.turnId)).size).toBe(240);
+    expect(room.players.reduce((sum, candidate) => sum + candidate.rollCount, 0)).toBe(240);
+  });
+
+  it('超过历史窗口仍准确累计投掷次数（A16）', () => {
+    const room = configuredRoom(2);
+    startGame(room, T0, 0);
+    for (let i = 0; i < 300; i++) {
+      applyRoll(room, currentPlayerId(room), NONE, T0 + i);
+      if (i % 10 === 0) skipExpiredTurn(room, room.deadline ?? 0);
+    }
+    expect(room.history).toHaveLength(240);
+    const rolls = room.players.reduce((sum, candidate) => sum + candidate.rollCount, 0);
+    const timeouts = room.players.reduce((sum, candidate) => sum + candidate.timeoutCount, 0);
+    expect(rolls + timeouts).toBeGreaterThan(300);
+    expect(rolls).toBe(300);
+    expect(timeouts).toBeGreaterThan(0);
+    expect(room.status).toBe('playing');
   });
 
   it('离开席位不重排顺序，轮数仍按完整顺序边界计算', () => {
@@ -161,6 +246,11 @@ describe('轮转与轮数上限', () => {
     applyRoll(room, 'p2', NONE, T0 + 1);
     expect(room.round).toBe(2); // 三人顺序跑完仍算一轮
     expect(room.turnPlayerId).toBe('p0');
+  });
+
+  it('maxRoundsOf 只对固定轮数模式返回上限', () => {
+    expect(maxRoundsOf(configuredRoom(2))).toBeNull();
+    expect(maxRoundsOf(makeRoom(2, { maxRounds: 10 }))).toBe(10);
   });
 });
 
@@ -181,49 +271,121 @@ describe('奖池与发奖', () => {
     expect(player(room, 'p1').awards.duitang).toBe(0);
   });
 
-  it('一次投掷只判最高牌型：四进不兼得二举，插金花不额外领对堂', () => {
+  it('一次投掷只判最高牌型：四进不兼得二举，插金花不额外领对堂，六红不清空奖池（A19）', () => {
     const room = makeRoom(2);
     startGame(room, T0, 0);
     const sijin = applyRoll(room, 'p0', SIJIN, T0);
     expect(sijin.result?.code).toBe('sijin');
     expect(sijin.awarded).toBe('sijin');
     expect(player(room, 'p0').awards.erju).toBe(0);
+    expect(player(room, 'p0').awards.yixiu).toBe(0);
 
     const cha = applyRoll(room, 'p1', CHAJINHUA, T0 + 1);
     expect(cha.result?.code).toBe('chajinhua');
     expect(cha.awarded).toBeNull(); // 状元整局结束时才发
     expect(room.pool.duitang).toBe(2); // 插金花不领对堂
-  });
 
-  it('普通奖全部领完时完成当前整轮后才结算，该轮其他人仍可掷', () => {
-    const room = makeRoom(3, { maxRounds: 5 });
-    startGame(room, T0, 0);
-    for (const key of ['duitang', 'sanhong', 'sijin', 'erju'] as const) room.pool[key] = 0;
-    room.pool.yixiu = 1;
-
-    applyRoll(room, 'p0', YIXIU, T0); // 最后一份一秀
-    expect(room.pool.yixiu).toBe(0);
-    expect(room.status).toBe('playing'); // 本轮未结束
-
-    applyRoll(room, 'p1', NONE, T0 + 1);
-    expect(room.status).toBe('playing');
-
-    applyRoll(room, 'p2', SIHONG, T0 + 2); // 本轮最后一人仍可争夺状元
-    expect(room.status).toBe('finished');
-    expect(room.finishedReason).toBe('pool-empty');
-    expect(room.champion?.playerId).toBe('p2');
-    expect(player(room, 'p2').awards.zhuangyuan).toBe(1);
-    expect(room.pool.zhuangyuan).toBe(0);
+    player(room, 'p0').awards.duitang = 1;
+    room.pool.duitang = 1;
+    applyRoll(room, 'p0', LIUHE, T0 + 2);
+    expect(player(room, 'p0').awards.duitang).toBe(1); // 六红不追回普通奖
+    expect(room.pool.duitang).toBe(1);
   });
 });
 
-describe('状元比较', () => {
-  it('超过当前领先者才替换，同分先到先得', () => {
+describe('收尾（奖品发完结束）', () => {
+  it('普通奖空缺状元时继续轮转，产生状元后收完当轮并发全部状元份数', () => {
+    const config = createDefaultRoomConfig();
+    config.prizes.zhuangyuan.count = 3;
+    const room = configuredRoom(3, config);
+    startGame(room, T0, 0);
+    for (const key of NORMAL_PRIZE_KEYS) room.pool[key] = 0;
+    for (let i = 0; i < 3; i++) applyRoll(room, currentPlayerId(room), NONE, T0 + i);
+    expect(room.status).toBe('playing');
+    expect(room.champion).toBeNull();
+    expect(room.closingRound).toBeNull(); // 普通奖空但无人状元 → 不进入收尾
+
+    applyRoll(room, 'p0', SIHONG, T0 + 3);
+    expect(room.closingRound).toBe(2);
+
+    applyRoll(room, 'p1', NONE, T0 + 4);
+    expect(room.status).toBe('playing'); // 本轮尚未结束
+
+    applyRoll(room, 'p2', WUHONG, T0 + 5);
+    expect(room.status).toBe('finished');
+    expect(room.finishedReason).toBe('pool-empty');
+    expect(room.incomplete).toBe(false);
+    expect(player(room, 'p2').awards.zhuangyuan).toBe(3);
+    expect(room.pool.zhuangyuan).toBe(0);
+
+    finishGame(room, 'pool-empty', T0 + 6);
+    expect(player(room, 'p2').awards.zhuangyuan).toBe(3); // 重复结算不重复发奖
+  });
+
+  it('收尾不多打一轮：本轮最后一人收尾后立即结算', () => {
+    const room = configuredRoom(4);
+    startGame(room, T0, 0);
+    for (const key of NORMAL_PRIZE_KEYS) room.pool[key] = 0;
+    applyRoll(room, 'p0', SIHONG, T0);
+    expect(room.closingRound).toBe(1);
+    applyRoll(room, 'p1', NONE, T0 + 1);
+    applyRoll(room, 'p2', WUHONG, T0 + 2); // 持续版严格更大 → 顶替
+    expect(room.champion?.playerId).toBe('p2');
+    expect(room.status).toBe('playing');
+    applyRoll(room, 'p3', NONE, T0 + 3);
+    expect(room.status).toBe('finished');
+    expect(room.history).toHaveLength(4); // 只完成当前整轮，第 2 轮从未开始
+    expect(room.closingRound).toBe(1);
+    expect(player(room, 'p2').awards.zhuangyuan).toBe(1);
+    expect(player(room, 'p0').awards.zhuangyuan).toBe(0);
+  });
+
+  it('收尾标记残留但没有状元时不按“奖品发完”结算，也不会一直挂着（防御旧数据）', () => {
+    const room = configuredRoom(2);
+    startGame(room, T0, 0);
+    for (const key of NORMAL_PRIZE_KEYS) room.pool[key] = 0;
+    room.closingRound = room.round; // 模拟旧数据留下的收尾标记
+    expect(room.champion).toBeNull();
+
+    applyRoll(room, 'p0', NONE, T0);
+    applyRoll(room, 'p1', NONE, T0 + 1); // 走到轮末
+    expect(room.status).toBe('playing');
+    expect(room.finishedReason).toBeNull();
+    expect(room.closingRound).toBeNull(); // 条件不成立时标记被清掉
+    expect(room.pool.zhuangyuan).toBe(1);
+
+    // 之后出现状元才正常收尾
+    applyRoll(room, 'p0', WUHONG, T0 + 2);
+    expect(room.closingRound).toBe(2);
+    applyRoll(room, 'p1', NONE, T0 + 3);
+    expect(room.status).toBe('finished');
+    expect(room.finishedReason).toBe('pool-empty');
+    expect(player(room, 'p0').awards.zhuangyuan).toBe(1);
+  });
+
+  it('固定轮数末轮同时满足收尾与上限时，按实际剩余奖品报告 pool-empty', () => {
+    const room = makeRoom(2, { maxRounds: 5 });
+    startGame(room, T0, 0);
+    for (const key of NORMAL_PRIZE_KEYS) room.pool[key] = 0;
+    for (let i = 0; i < 9; i++) applyRoll(room, currentPlayerId(room), NONE, T0 + i);
+    expect(room.status).toBe('playing');
+    expect(room.round).toBe(5);
+    applyRoll(room, currentPlayerId(room), WUHONG, T0 + 9);
+    expect(room.status).toBe('finished');
+    expect(room.finishedReason).toBe('pool-empty');
+    expect(player(room, 'p1').awards.zhuangyuan).toBe(1);
+  });
+});
+
+describe('状元比较与锁定', () => {
+  it('超过当前领先者才替换，同分先到先得，持续版永不锁定', () => {
     const room = makeRoom(3);
     startGame(room, T0, 0);
     applyRoll(room, 'p0', SIHONG, T0); // [6,8,0]
     expect(room.champion?.playerId).toBe('p0');
     expect(room.champion?.result.rankKey).toEqual([6, 8, 0]);
+    expect(room.champion?.locked).toBe(false);
+    expect(room.champion?.lockedBy).toBeNull();
 
     applyRoll(room, 'p1', [4, 4, 4, 4, 3, 5], T0 + 1); // 同为四红，和也是 8 → 同分保留 p0
     expect(room.champion?.playerId).toBe('p0');
@@ -231,6 +393,7 @@ describe('状元比较', () => {
     applyRoll(room, 'p2', WUHONG, T0 + 2); // 五红更高 → 替换
     expect(room.champion?.playerId).toBe('p2');
     expect(room.champion?.result.rankKey).toEqual([8, 6, 0]);
+    expect(room.champion?.locked).toBe(false);
 
     // 每人保留自己的最佳状元成绩
     expect(player(room, 'p0').best?.rankKey).toEqual([6, 8, 0]);
@@ -245,9 +408,59 @@ describe('状元比较', () => {
     expect(room.champion?.playerId).toBe('p0');
     expect(room.champion?.at).toBe(T0);
   });
+
+  it('五子登科比相同点数再比剩余一颗（A20）', () => {
+    const room = makeRoom(3);
+    startGame(room, T0, 0);
+    applyRoll(room, 'p0', [2, 2, 2, 2, 2, 4], T0); // [7,2,4]
+    applyRoll(room, 'p1', [2, 2, 2, 2, 2, 1], T0 + 1); // [7,2,1] → 更小，不替换
+    expect(room.champion?.playerId).toBe('p0');
+    applyRoll(room, 'p2', [3, 3, 3, 3, 3, 1], T0 + 2); // [7,3,1] → 相同点数更大 → 替换
+    expect(room.champion?.playerId).toBe('p2');
+  });
+
+  it('高阶锁定：先五红后插金花不能换人，普通奖未空仍继续（A05、A06）', () => {
+    const room = configuredRoom(3, lockConfig());
+    startGame(room, T0, 0);
+    applyRoll(room, 'p0', WUHONG, T0);
+    expect(room.champion?.playerId).toBe('p0');
+    expect(room.champion?.locked).toBe(true);
+    expect(room.champion?.lockedBy).toBe('wuhong');
+
+    applyRoll(room, 'p1', CHAJINHUA, T0 + 1);
+    expect(room.champion?.playerId).toBe('p0'); // 更大的插金花也不能换人
+    expect(room.status).toBe('playing'); // 锁定不提前结束整局
+    expect(room.closingRound).toBeNull();
+  });
+
+  it('高阶锁定：四红、五子仍可争夺，六黑出现后锁定', () => {
+    const room = configuredRoom(3, lockConfig());
+    startGame(room, T0, 0);
+    applyRoll(room, 'p0', SIHONG, T0);
+    expect(room.champion?.locked).toBe(false);
+    applyRoll(room, 'p1', WUZI, T0 + 1); // 五子 [7,2,4] > 四红 [6,8,0]
+    expect(room.champion?.playerId).toBe('p1');
+    expect(room.champion?.locked).toBe(false);
+    applyRoll(room, 'p2', LIUHE, T0 + 2); // 六黑 [9,6,0] → 锁定
+    expect(room.champion?.playerId).toBe('p2');
+    expect(room.champion?.locked).toBe(true);
+    expect(room.champion?.lockedBy).toBe('liuhe');
+    applyRoll(room, 'p0', CHAJINHUA, T0 + 3);
+    expect(room.champion?.playerId).toBe('p2'); // 锁定后更大也不能换人
+  });
+
+  it('状元候选离席保留资格，最终仍归原得主', () => {
+    const room = makeRoom(3);
+    startGame(room, T0, 0);
+    applyRoll(room, 'p0', WUHONG, T0);
+    player(room, 'p0').left = true;
+    finishGame(room, 'host-ended', T0 + 1);
+    expect(player(room, 'p0').awards.zhuangyuan).toBe(1);
+    expect(room.pool.zhuangyuan).toBe(0);
+  });
 });
 
-describe('结算幂等', () => {
+describe('结算幂等与损坏防护', () => {
   it('状元只发一次，重复 finishGame 不重复发奖', () => {
     const room = makeRoom(2);
     startGame(room, T0, 0);
@@ -256,13 +469,14 @@ describe('结算幂等', () => {
     expect(room.status).toBe('finished');
     expect(room.pool.zhuangyuan).toBe(0);
     expect(player(room, 'p0').awards.zhuangyuan).toBe(1);
+    expect(room.incomplete).toBe(true); // 主动中止属于未完成
 
     finishGame(room, 'host-ended', T0 + 2);
     expect(player(room, 'p0').awards.zhuangyuan).toBe(1);
     expect(room.pool.zhuangyuan).toBe(0);
   });
 
-  it('无人夺魁时状元空缺且库存保留 1', () => {
+  it('无人夺魁时状元空缺且库存保留', () => {
     const room = makeRoom(2);
     startGame(room, T0, 0);
     applyRoll(room, 'p0', NONE, T0);
@@ -286,10 +500,20 @@ describe('结算幂等', () => {
     expect(player(room, 'p1').awards.erju).toBe(1);
     expect(player(room, 'p0').awards.erju).toBe(0);
   });
+
+  it('状元得主记录损坏时结算抛错，不先扣库存再悄悄丢奖', () => {
+    const room = makeRoom(2);
+    startGame(room, T0, 0);
+    applyRoll(room, 'p0', WUHONG, T0);
+    room.players = room.players.filter((candidate) => candidate.id !== 'p0');
+    expect(() => finishGame(room, 'host-ended', T0 + 1)).toThrow(/状元玩家不在房间内/);
+    expect(room.status).toBe('playing');
+    expect(room.pool.zhuangyuan).toBe(1);
+  });
 });
 
 describe('超时跳过', () => {
-  it('到点只跳过 1 次，无骰子无奖，重复调用不再轮转', () => {
+  it('到点只跳过 1 次，无骰子无奖，重复调用不再轮转，累计 timeoutCount', () => {
     const room = makeRoom(2);
     startGame(room, T0, 0);
 
@@ -302,11 +526,14 @@ describe('超时跳过', () => {
     expect(record.awarded).toBeNull();
     expect(room.turnPlayerId).toBe('p1');
     expect(room.deadline).toBe(T0 + TURN_MS + TURN_MS);
+    expect(player(room, 'p0').timeoutCount).toBe(1);
+    expect(room.pool).toEqual(room.initialPool);
 
     // 同一时刻重复 tick 不再产生第二条记录
     expect(skipExpiredTurn(room, T0 + TURN_MS)).toBe(false);
     expect(skipExpiredTurn(room, T0 + TURN_MS + 1)).toBe(false);
     expect(room.history).toHaveLength(1);
+    expect(player(room, 'p0').timeoutCount).toBe(1);
   });
 
   it('超时也消耗机会，与掷骰交错时不会重复轮转', () => {
@@ -318,6 +545,8 @@ describe('超时跳过', () => {
     expect(room.history.map((record) => record.reason)).toEqual(['rolled', 'timeout', 'rolled']);
     expect(room.round).toBe(2);
     expect(room.turnPlayerId).toBe('p1');
+    expect(player(room, 'p0').rollCount).toBe(2);
+    expect(player(room, 'p1').timeoutCount).toBe(1);
   });
 
   it('暂停期间不判超时', () => {
@@ -328,6 +557,7 @@ describe('超时跳过', () => {
     expect(room.deadline).toBeNull();
     expect(skipExpiredTurn(room, T0 + 10 * TURN_MS)).toBe(false);
     expect(room.history).toHaveLength(0);
+    expect(room.expiresAt).toBeNull(); // 到期时间由服务层按离线起点计算，game 层不改
   });
 });
 
@@ -346,24 +576,44 @@ describe('暂停与恢复', () => {
   });
 });
 
-describe('离开与人数不足', () => {
-  it('对局中离开保留历史、跳过其回合，少于 2 人提前结算', () => {
+describe('离开与人数', () => {
+  it('开局后仅剩一位在席成员仍可继续投掷（A14）', () => {
     const room = makeRoom(3, { maxRounds: 5 });
     startGame(room, T0, 0);
-    applyRoll(room, 'p0', NONE, T0);
+    applyRoll(room, 'p0', NONE, T0); // p0 → p1
 
     player(room, 'p1').left = true;
     expect(dropCurrentTurnIfPlayer(room, 'p1', T0 + 1)).toBe(true);
     expect(room.turnPlayerId).toBe('p2');
     expect(room.status).toBe('playing');
-    expect(room.history).toHaveLength(1); // 历史保留
 
     player(room, 'p2').left = true;
-    if (activePlayers(room).length < 2) finishGame(room, 'players-left', T0 + 2);
-    expect(room.status).toBe('finished');
-    expect(room.finishedReason).toBe('players-left');
+    expect(dropCurrentTurnIfPlayer(room, 'p2', T0 + 2)).toBe(true);
+    expect(activePlayers(room).map((candidate) => candidate.id)).toEqual(['p0']);
+    expect(room.status).toBe('playing'); // 只剩一人继续，不因人数少于两人结束
+
+    applyRoll(room, 'p0', NONE, T0 + 3);
+    expect(room.status).toBe('playing');
+    expect(room.history).toHaveLength(2);
+    // 顺序里两个已离席席位被跳过，轮数仍按完整顺序边界计算
+    expect(room.round).toBe(3);
+  });
+
+  it('全员主动离席按未完成关闭并保留记录', () => {
+    const room = makeRoom(3, { maxRounds: 5 });
+    startGame(room, T0, 0);
+    applyRoll(room, 'p0', DUITANG, T0);
+    player(room, 'p1').left = true;
+    dropCurrentTurnIfPlayer(room, 'p1', T0 + 1);
+    player(room, 'p2').left = true;
+    dropCurrentTurnIfPlayer(room, 'p2', T0 + 2);
+    player(room, 'p0').left = true;
+    expect(dropCurrentTurnIfPlayer(room, 'p0', T0 + 3)).toBe(true);
+    expect(room.status).toBe('closed');
+    expect(room.finishedReason).toBe('all-left');
+    expect(room.incomplete).toBe(true);
     expect(room.history).toHaveLength(1);
-    expect(room.players).toHaveLength(3);
+    expect(player(room, 'p0').awards.duitang).toBe(1);
   });
 });
 
@@ -426,7 +676,7 @@ describe('再开一局重置', () => {
     expect(room.gameNumber).toBe(2);
     expect(room.status).toBe('waiting');
     expect(room.round).toBe(0);
-    expect(room.players.map((player) => player.id)).toEqual(['p0', 'p1']);
+    expect(room.players.map((candidate) => candidate.id)).toEqual(['p0', 'p1']);
     expect(room.players[0].ready).toBe(true); // 房主默认准备
     expect(room.players[1].ready).toBe(false); // 非房主准备取消
     expect(room.players[0].awards).toEqual({ zhuangyuan: 0, duitang: 0, sanhong: 0, sijin: 0, erju: 0, yixiu: 0 });
@@ -434,7 +684,42 @@ describe('再开一局重置', () => {
     expect(room.history).toEqual([]);
     expect(room.champion).toBeNull();
     expect(room.finishedReason).toBeNull();
+    expect(room.incomplete).toBe(false);
     expect(room.turnOrder).toEqual([]);
+  });
+
+  it('再开一局沿用本房间配置并清空库存、锁定、收尾与累计统计（A11）', () => {
+    const config = lockConfig();
+    config.prizes.yixiu = { count: 7, content: '月饼一盒' };
+    const room = configuredRoom(2, config);
+    startGame(room, T0, 0);
+    applyRoll(room, 'p0', WUHONG, T0); // 锁定 + 状元候选
+    applyRoll(room, 'p1', YIXIU, T0 + 1);
+    finishGame(room, 'host-ended', T0 + 2);
+    expect(player(room, 'p0').awards.zhuangyuan).toBe(1);
+    expect(room.players.some((candidate) => candidate.rollCount > 0)).toBe(true);
+
+    prepareRematch(room, T0 + 3);
+    expect(room.config).toEqual(config);
+    expect(room.ruleset.id).toBe('high-tier-lock');
+    expect(room.initialPool.yixiu).toBe(7);
+    expect(room.pool.yixiu).toBe(7);
+    expect(room.pool.zhuangyuan).toBe(1);
+    expect(room.champion).toBeNull();
+    expect(room.closingRound).toBeNull();
+    expect(room.incomplete).toBe(false);
+    expect(room.players.every((candidate) => candidate.rollCount === 0 && candidate.timeoutCount === 0)).toBe(true);
+    expect(room.players.every((candidate) => candidate.awards.zhuangyuan === 0)).toBe(true);
+  });
+
+  it('开局时配置与规则快照按房间保存，不随注册表变化改判', () => {
+    const room = configuredRoom(2, lockConfig());
+    startGame(room, T0, 0);
+    // 快照是独立深拷贝：预设对象不被房间修改影响
+    expect(room.ruleset).toEqual(snapshotRuleset('high-tier-lock'));
+    room.ruleset.name = '被改过的名字';
+    expect(snapshotRuleset('high-tier-lock').name).toBe('高阶锁定');
+    expect(poolFromConfig(room.config)).toEqual(room.initialPool);
   });
 });
 

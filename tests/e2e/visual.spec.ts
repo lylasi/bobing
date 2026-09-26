@@ -139,7 +139,7 @@ test.describe('视觉与组件', () => {
       await screenshot(desktop, '30-share-dialog-1440');
       await desktop.keyboard.press('Escape');
       await desktop.getByRole('button', { name: '规则' }).first().click();
-      await expect(desktop.getByRole('dialog', { name: '线上统一房规 v1' })).toBeVisible();
+      await expect(desktop.getByRole('dialog', { name: /持续顶状元.*房间规则/ })).toBeVisible();
       await screenshot(desktop, '31-rules-dialog-1440');
       await desktop.keyboard.press('Escape');
     } finally {

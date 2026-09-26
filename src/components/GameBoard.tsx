@@ -7,13 +7,14 @@ import { useState } from 'react';
 import type { ReactElement } from 'react';
 import { TURN_DURATION_MS } from '../../shared/rules.js';
 import type { RollRecord, RoomState } from '../../shared/types.js';
+import { useCountdown } from '../hooks/useCountdown.js';
+import type { DicePhase } from '../hooks/useDiceAnimation.js';
+import type { ConnectionState } from '../hooks/useRoom.js';
+import { currentTurnPlayer, describeRoll, formatRemaining, latestRoll } from '../lib/format.js';
 import { Bowl } from './Bowl.js';
 import { History } from './History.js';
 import { PlayerList } from './PlayerList.js';
 import { PrizePool } from './PrizePool.js';
-import { currentTurnPlayer, describeRoll, formatRemaining, latestRoll } from '../lib/format.js';
-import { useCountdown } from '../hooks/useCountdown.js';
-import type { ConnectionState } from '../hooks/useRoom.js';
 
 export interface GameBoardProps {
   room: RoomState;
@@ -21,6 +22,8 @@ export interface GameBoardProps {
   connection: ConnectionState;
   rollPending: boolean;
   spinning: boolean;
+  phase: DicePhase;
+  settledCount: number;
   dice: number[] | null;
   revealed: RollRecord | null;
   now: () => number;
@@ -35,6 +38,8 @@ export function GameBoard({
   connection,
   rollPending,
   spinning,
+  phase,
+  settledCount,
   dice,
   revealed,
   now,
@@ -42,18 +47,12 @@ export function GameBoard({
 }: GameBoardProps): ReactElement {
   const [tab, setTab] = useState<GameTab>('players');
   const rawRemaining = useCountdown(room.deadline, now);
-  /**
-   * 服务端每回合的 deadline 就是「回合开始 + TURN_DURATION_MS」，真实剩余时间不可能超过它。
-   * 读数大于回合时长只可能来自 HTTP Date 秒级校时的误差（截断误差最大 1 秒），
-   * 因此展示值一律钳制在 0–30 秒，绝不出现「剩余 31 秒」。
-   */
   const remaining = Math.min(rawRemaining, TURN_DURATION_MS);
   const current = currentTurnPlayer(room);
   const isMyTurn = room.turnPlayerId === playerId;
   const shown = revealed ?? latestRoll(room);
-  const headline = shown ? describeRoll(shown) : null;
+  const headline = shown ? describeRoll(shown, room) : null;
   const urgent = !room.paused && room.deadline !== null && remaining <= 5000;
-  /** 本地倒计时已到 0：立即禁用按钮并提示正在与服务端同步，最终仍以服务端裁决为准。 */
   const expired = room.deadline !== null && !room.paused && remaining <= 0;
   const rolling = rollPending || spinning;
   const canRoll =
@@ -82,11 +81,22 @@ export function GameBoard({
     </button>
   );
 
+  const roundNumber = Math.max(1, room.round);
+
   return (
     <div className="game">
       <div className={`turn-bar ${urgent ? 'turn-bar--urgent' : ''}`}>
         <span className="turn-round">
-          第 <strong>{Math.max(1, room.round)}</strong>/{room.maxRounds} 轮
+          {room.config.endCondition.mode === 'rounds' ? (
+            <>
+              第 <strong>{roundNumber}</strong>/{room.config.endCondition.maxRounds} 轮
+            </>
+          ) : (
+            <>
+              第 <strong>{roundNumber}</strong> 轮
+            </>
+          )}
+          {room.closingRound !== null ? <span className="turn-closing">本轮收尾</span> : null}
         </span>
         <span className="turn-player">
           当前玩家：<strong>{current ? current.nickname : '—'}</strong>
@@ -111,7 +121,13 @@ export function GameBoard({
 
         <div className="game-panel game-panel--center col-center">
           <div className="card game-center">
-            <Bowl dice={dice} spinning={spinning} size="game" />
+            <Bowl
+              dice={dice}
+              spinning={spinning}
+              phase={phase}
+              settledCount={settledCount}
+              size="game"
+            />
             <p className={`game-hint ${canRoll ? 'game-hint--mine' : ''}`} id="game-turn-hint" role="status" aria-live="polite">
               {turnHint}
             </p>
@@ -143,11 +159,6 @@ export function GameBoard({
           </div>
         </div>
 
-        {/*
-          Tab 栏紧跟中心区：移动端用 flex order 排成
-          「轮次栏 → 中心碗/提示/最新结果 → Tab → 当前面板」，桌面端整体 display:none。
-          中心区不属于任何 Tab，切换 Tab 永远不会隐藏碗与最新结果。
-        */}
         <div className="game-tabs" role="tablist" aria-label="对局信息">
           {(
             [
@@ -190,11 +201,10 @@ export function GameBoard({
         aria-labelledby="game-tab-history"
       >
         <div className="card">
-          <History history={room.history} />
+          <History history={room.history} room={room} />
         </div>
       </div>
 
-      {/* 移动端固定在底部的唯一主操作（桌面隐藏，避免出现两个同名按钮） */}
       <div className="action-bar">{rollButton}</div>
     </div>
   );

@@ -35,12 +35,28 @@ test.describe('响应式布局', () => {
           const primary = page.getByRole('button', { name: '创建房间' });
           const box = await primary.boundingBox();
           expect(box!.height, `${viewport.name}: 主按钮高度不足 44px`).toBeGreaterThanOrEqual(44);
+          const disclosure = page.getByRole('button', { name: '调整奖品与个人方案' });
+          await expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+          const disclosureBox = await disclosure.boundingBox();
+          expect(disclosureBox!.height, `${viewport.name}: 展开按钮高度不足 44px`).toBeGreaterThanOrEqual(44);
+          if (viewport.name === '375') {
+            const metrics = await page.evaluate(() => {
+              const btn = document.querySelector<HTMLButtonElement>('#panel-create button[type="submit"]');
+              const rect = btn?.getBoundingClientRect();
+              return {
+                createBtnY: Math.round((rect?.top ?? 0) + window.scrollY),
+                pageHeight: document.documentElement.scrollHeight,
+              };
+            });
+            expect(metrics.createBtnY, '375 下默认创建按钮 Y 仍过深').toBeLessThan(1600);
+            expect(metrics.pageHeight, '375 下默认首页总高仍过长').toBeLessThan(2600);
+          }
           await expectNoHorizontalOverflow(page);
           await screenshot(page, `20-home-${viewport.name}`);
 
           await page.goto('/rules');
           await expect(page.getByRole('heading', { name: '博饼怎么玩' })).toBeVisible();
-          await expect(page.getByText('状元插金花')).toBeVisible();
+          await expect(page.getByText('状元插金花', { exact: true })).toBeVisible();
           await expect(page.getByText(/rankKey/i)).toHaveCount(0);
           await expectNoHorizontalOverflow(page);
           await screenshot(page, `21-rules-${viewport.name}`);

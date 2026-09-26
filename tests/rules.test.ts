@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   DICE_FACES,
+  DEFAULT_PRIZE_COUNTS,
   INITIAL_POOL,
   NORMAL_PRIZE_KEYS,
   PRIZE_KEYS,
@@ -344,6 +345,15 @@ describe('奖池与规则元数据', () => {
   it('INITIAL_POOL 与文档数量一致', () => {
     expect(INITIAL_POOL).toEqual({ zhuangyuan: 1, duitang: 2, sanhong: 4, sijin: 8, erju: 16, yixiu: 32 });
     expect(PRIZE_KEYS.reduce((sum, key) => sum + INITIAL_POOL[key], 0)).toBe(63);
+  });
+
+  it('默认数量只有一份数据来源：PRIZE_META 与 INITIAL_POOL 都派生自 DEFAULT_PRIZE_COUNTS', () => {
+    expect(DEFAULT_PRIZE_COUNTS).toEqual({ zhuangyuan: 1, duitang: 2, sanhong: 4, sijin: 8, erju: 16, yixiu: 32 });
+    for (const key of PRIZE_KEYS) {
+      expect(PRIZE_META[key].count).toBe(DEFAULT_PRIZE_COUNTS[key]);
+      expect(INITIAL_POOL[key]).toBe(DEFAULT_PRIZE_COUNTS[key]);
+      expect(Number.isSafeInteger(DEFAULT_PRIZE_COUNTS[key])).toBe(true);
+    }
   });
 
   it('emptyAwards 覆盖全部六档且为 0', () => {

@@ -371,13 +371,13 @@ button {
 .form {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 12px;
 }
 
 .form-field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   border: none;
   margin: 0;
   padding: 0;
@@ -482,7 +482,7 @@ button {
   padding: 4px;
   border-radius: 14px;
   background: var(--surface-muted);
-  margin-bottom: 20px;
+  margin-bottom: 14px;
 }
 
 .tab {
@@ -642,19 +642,82 @@ button {
 
 .bowl-slot {
   position: absolute;
+  transition: transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.bowl--spinning .dice {
-  animation: dice-shake 0.42s ease-in-out infinite alternate;
+.bowl-slot--settled {
+  transform: translate(0, 0) rotate(0deg) scale(1);
 }
 
-@keyframes dice-shake {
-  from {
-    transform: translateY(-3px) rotate(-4deg);
+@keyframes dice-tumble {
+  0% {
+    transform: translate(-12px, -22px) rotate(-24deg) scale(0.94);
   }
-  to {
-    transform: translateY(3px) rotate(4deg);
+  45% {
+    transform: translate(10px, 6px) rotate(18deg) scale(1.03);
   }
+  75% {
+    transform: translate(-6px, -8px) rotate(-11deg) scale(0.98);
+  }
+  100% {
+    transform: translate(0, 0) rotate(0deg) scale(1);
+  }
+}
+
+@keyframes dice-land {
+  0% {
+    transform: translate(6px, -14px) rotate(14deg) scale(1.04);
+  }
+  55% {
+    transform: translate(-4px, 5px) rotate(-9deg) scale(0.96);
+  }
+  100% {
+    transform: translate(0, 0) rotate(0deg) scale(1);
+  }
+}
+
+@keyframes dice-collide {
+  0% {
+    transform: translate(-7px, 4px) rotate(-12deg);
+  }
+  50% {
+    transform: translate(6px, -5px) rotate(10deg);
+  }
+  100% {
+    transform: translate(-2px, 2px) rotate(-4deg);
+  }
+}
+
+@keyframes dice-settle {
+  0% {
+    transform: translate(3px, -2px) rotate(6deg);
+  }
+  60% {
+    transform: translate(-2px, 1px) rotate(-3deg);
+  }
+  100% {
+    transform: translate(0, 0) rotate(0deg);
+  }
+}
+
+.bowl[data-phase='tumbling'] .bowl-slot--moving {
+  animation: dice-tumble 320ms ease-in-out infinite;
+  animation-delay: calc(var(--die-index, 0) * -47ms);
+}
+
+.bowl[data-phase='landing'] .bowl-slot--moving {
+  animation: dice-land 240ms cubic-bezier(0.34, 1.56, 0.64, 1) infinite;
+  animation-delay: calc(var(--die-index, 0) * -37ms);
+}
+
+.bowl[data-phase='colliding'] .bowl-slot--moving {
+  animation: dice-collide 200ms ease-in-out infinite alternate;
+  animation-delay: calc(var(--die-index, 0) * -29ms);
+}
+
+.bowl[data-phase='settling'] .bowl-slot--moving {
+  animation: dice-settle 160ms ease-out infinite;
+  animation-delay: calc(var(--die-index, 0) * -23ms);
 }
 
 .bowl-caption {
@@ -664,8 +727,10 @@ button {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .bowl .bowl-slot,
   .bowl--spinning .dice {
-    animation: none;
+    animation: none !important;
+    transition: none !important;
   }
 }
 
@@ -673,27 +738,27 @@ button {
 
 .home-main {
   flex: 1;
-  padding-bottom: 64px;
+  padding-bottom: 40px;
 }
 
 .home-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 420px;
-  gap: 48px;
+  grid-template-columns: minmax(0, 1fr) 500px;
+  gap: 32px;
   align-items: start;
-  padding: 56px 0 40px;
+  padding: 20px 0 16px;
 }
 
 .eyebrow {
   font-size: 14px;
   letter-spacing: 0.16em;
   color: var(--text-secondary);
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 .home-title {
   font-size: 60px;
-  line-height: 1.25;
+  line-height: 1.22;
   letter-spacing: 0.01em;
 }
 
@@ -705,16 +770,16 @@ button {
 }
 
 .home-subtitle {
-  margin-top: 16px;
+  margin-top: 10px;
   font-size: 18px;
   color: var(--text-secondary);
 }
 
 .home-points {
-  margin-top: 20px;
+  margin-top: 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   font-size: 15px;
   color: var(--text-secondary);
 }
@@ -736,7 +801,7 @@ button {
 }
 
 .home-visual {
-  margin-top: 36px;
+  margin-top: 20px;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -758,17 +823,17 @@ button {
 }
 
 .home-panel {
-  padding-top: 8px;
+  padding-top: 0;
 }
 
 .form-card {
   position: sticky;
-  top: 104px;
+  top: 100px;
 }
 
 .home-steps,
 .home-prizes {
-  margin-top: 40px;
+  margin-top: 28px;
 }
 
 .steps {
@@ -2044,6 +2109,398 @@ button {
   color: var(--red-active);
 }
 
+/* ---------- 房间配置表单与个人方案 ---------- */
+
+.room-config-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.config-fieldset {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 8px 10px;
+  background: rgba(251, 246, 238, 0.55);
+  gap: 6px;
+}
+
+.config-fieldset > legend.field-label {
+  padding: 0 6px;
+}
+
+.config-radio-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.config-radio-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.config-radio-card.is-active {
+  border-color: var(--red);
+  background: var(--gold-light);
+}
+
+.config-radio-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.config-radio-head input[type='radio'] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--red);
+  margin: 0;
+  flex: none;
+}
+
+.config-radio-title {
+  font-size: 14px;
+}
+
+.config-radio-desc {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.config-rounds-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+
+.config-advanced-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(251, 246, 238, 0.65);
+}
+
+.config-summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.config-summary-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.config-summary-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.config-summary-meta {
+  font-size: 13px;
+  color: var(--red-active);
+  font-weight: 600;
+}
+
+.config-summary-counts {
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.config-disclosure-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.config-disclosure-btn.is-expanded {
+  border-color: var(--red);
+  background: var(--gold-light);
+  color: var(--red-active);
+}
+
+.config-disclosure-state {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.config-advanced-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+
+.config-advanced-panel[hidden] {
+  display: none !important;
+}
+
+.config-section-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.config-prizes-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.config-prize-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.config-prize-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.config-prize-name {
+  font-family: var(--font-title);
+  font-size: 15px;
+  font-weight: 700;
+  flex: none;
+}
+
+.config-prize-desc {
+  font-size: 11px;
+  line-height: 1.25;
+  color: var(--text-secondary);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-prize-inputs {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 6px;
+  align-items: end;
+}
+
+.config-prize-count-wrap,
+.config-prize-content-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.config-prize-inputs .field-label {
+  font-size: 12px;
+}
+
+.config-count-input {
+  font-family: var(--font-numeric);
+}
+
+.config-templates-box {
+  background: var(--surface);
+}
+
+.config-template-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.config-template-select-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.config-template-select-group select {
+  flex: 1;
+  min-width: 0;
+}
+
+.config-template-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.config-template-ok {
+  font-size: 14px;
+  color: #3f7350;
+}
+
+/* ---------- 奖品内容、等待室奖池、收尾与音效状态 ---------- */
+
+.prize-content {
+  display: inline-block;
+  font-size: 13px;
+  color: var(--red-active);
+  background: var(--gold-light);
+  border: 1px solid rgba(212, 164, 76, 0.45);
+  border-radius: 6px;
+  padding: 1px 8px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.prize-row-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+}
+
+.prize-row {
+  grid-template-columns: minmax(64px, auto) minmax(0, 1fr) auto;
+}
+
+.waiting-head-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.waiting-prizes,
+.landing-prizes,
+.result-prizes-breakdown {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.waiting-prizes-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.waiting-prize-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.waiting-prize-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-muted);
+  font-size: 14px;
+}
+
+.waiting-prize-name {
+  font-family: var(--font-title);
+  font-weight: 700;
+}
+
+.waiting-prize-count {
+  font-family: var(--font-numeric);
+  color: var(--text-secondary);
+}
+
+.waiting-config-notice {
+  font-size: 14px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+}
+
+.waiting-config-error {
+  margin-bottom: 12px;
+}
+
+.room-closing,
+.turn-closing {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: rgba(200, 62, 49, 0.12);
+  color: var(--red-active);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tag-incomplete {
+  margin-left: 8px;
+  background: rgba(200, 62, 49, 0.12);
+  color: var(--red-active);
+}
+
+.champion-card--locked {
+  border-color: var(--red);
+  box-shadow: inset 0 0 0 1px rgba(200, 62, 49, 0.25);
+}
+
+.champion-lock-note {
+  font-size: 12px;
+  color: var(--red-active);
+}
+
+.btn-sound--on {
+  border-color: var(--red);
+  background: var(--gold-light);
+  color: var(--red-active);
+  font-weight: 600;
+}
+
+.rules-preset-detail {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface-muted);
+}
+
 /* ---------- 平板 ---------- */
 
 @media (max-width: 1199px) {
@@ -2296,8 +2753,37 @@ button {
     max-width: 260px;
   }
 
+  .home-grid {
+    padding: 12px 0 12px;
+    gap: 16px;
+  }
+
+  .home-visual {
+    margin-top: 14px;
+  }
+
+  .home-steps,
+  .home-prizes {
+    margin-top: 20px;
+  }
+
+  .steps {
+    gap: 10px;
+    margin-top: 10px;
+  }
+
+  .steps li {
+    padding: 12px 14px;
+  }
+
   .prize-overview {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .prize-overview li {
+    padding: 10px;
   }
 
   .prize-rows {
@@ -2305,7 +2791,8 @@ button {
   }
 
   .form-row {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1.45fr) minmax(96px, 0.85fr);
+    gap: 10px;
   }
 
   .page-title {
@@ -2333,12 +2820,12 @@ button {
     line-height: 1.35;
   }
 
-  /* 房间次操作：两列网格，每个按钮独占一格；文案整句不拆字，点击区 ≥44px。
-     四个按钮（邀请亲友/规则/提前结束/离开房间）在 375px 下正好两行两列。 */
+  /* 房间次操作：三列网格，每个按钮独占一格；文案整句不拆字，点击区 ≥44px。
+     五个按钮（音效/邀请亲友/规则/提前结束/离开房间）在 375px 下正好两行，不增加首屏高度。 */
   .room-header-actions {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
     width: 100%;
   }
 
@@ -2346,8 +2833,40 @@ button {
     width: 100%;
     min-width: 0;
     min-height: 44px;
-    padding: 0 12px;
+    padding: 0 6px;
+    font-size: 13px;
     white-space: nowrap;
+  }
+
+  .config-prizes-list,
+  .config-template-row,
+  .waiting-prize-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .config-disclosure-btn {
+    width: 100%;
+  }
+
+  .config-prize-item {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  .config-prize-header {
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .config-prize-inputs {
+    grid-template-columns: 84px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .config-template-select-group {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .rules-result {

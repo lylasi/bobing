@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "月满博饼 · 中秋博饼多人网页（线上统一房规 v1）",
+  "description": "月满博饼 · 支持系统房规与奖品配置的中秋博饼多人网页",
   "engines": {
     "node": ">=24.0.0"
   },

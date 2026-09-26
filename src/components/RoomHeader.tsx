@@ -1,11 +1,12 @@
 /**
- * 房间顶部：房名、局编号、6位房码、连接状态，以及邀请/规则/结束/离开等文字按钮。
- * “提前结束”和“离开房间”放在顶部的次要区域，与底部主掷骰按钮保持距离。
+ * 房间顶部：房名、局编号、6位房码、系统房规、结束方式、连接状态，
+ * 以及音效开关/邀请/规则/结束/离开等文字按钮。
  */
 
 import type { ReactElement } from 'react';
 import type { RoomState } from '../../shared/types.js';
 import type { ConnectionState } from '../hooks/useRoom.js';
+import { endConditionLabel } from '../lib/format.js';
 
 const CONNECTION_TEXT: Readonly<Record<ConnectionState, string>> = {
   connecting: '连接中…',
@@ -18,6 +19,8 @@ export interface RoomHeaderProps {
   connection: ConnectionState;
   isHost: boolean;
   showHostEnd: boolean;
+  soundEnabled: boolean;
+  onToggleSound: () => void;
   onInvite: () => void;
   onRules: () => void;
   onEndRequest: () => void;
@@ -29,6 +32,8 @@ export function RoomHeader({
   connection,
   isHost,
   showHostEnd,
+  soundEnabled,
+  onToggleSound,
   onInvite,
   onRules,
   onEndRequest,
@@ -40,6 +45,9 @@ export function RoomHeader({
         <div className="room-title-row">
           <h1 className="room-title">{room.name}</h1>
           <span className="room-game">第 {room.gameNumber} 局</span>
+          {room.closingRound !== null && room.status === 'playing' ? (
+            <span className="room-closing">本轮收尾</span>
+          ) : null}
         </div>
         <div className="room-meta">
           <span className="room-code" aria-label={`房间码 ${room.code}`}>
@@ -52,8 +60,8 @@ export function RoomHeader({
           <span className="room-meta-item">
             {room.players.filter((player) => !player.left).length}/{room.maxPlayers} 人
           </span>
-          <span className="room-meta-item">每人 {room.maxRounds} 轮</span>
-          <span className="room-meta-item">线上统一房规 v1</span>
+          <span className="room-meta-item">{endConditionLabel(room.config.endCondition)}</span>
+          <span className="room-meta-item">{room.ruleset.name}</span>
           <span className={`connection connection--${connection}`}>
             <span className="connection-dot" aria-hidden="true" />
             {CONNECTION_TEXT[connection]}
@@ -62,6 +70,15 @@ export function RoomHeader({
       </div>
 
       <div className="room-header-actions">
+        <button
+          type="button"
+          className={`btn btn-secondary btn-small ${soundEnabled ? 'btn-sound--on' : ''}`}
+          aria-pressed={soundEnabled}
+          aria-label={soundEnabled ? '关闭音效' : '开启音效'}
+          onClick={onToggleSound}
+        >
+          {soundEnabled ? '关闭音效' : '开启音效'}
+        </button>
         <button type="button" className="btn btn-secondary btn-small" onClick={onInvite}>
           邀请亲友
         </button>

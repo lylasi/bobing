@@ -30,13 +30,52 @@ export type RoomStatus = 'waiting' | 'playing' | 'finished' | 'closed';
 /** 状元比较键：从左到右字典序比较，较大者胜；完全相同则先到先得。 */
 export type RankKey = [number, number, number];
 
-export type FinishedReason = 'round-limit' | 'pool-empty' | 'host-ended' | 'players-left';
+/** 结束原因。`offline-expired`（离线过期）与 `all-left`（全员离席关闭）属于未完成。 */
+export type FinishedReason =
+  | 'round-limit'
+  | 'pool-empty'
+  | 'host-ended'
+  | 'players-left'
+  | 'offline-expired'
+  | 'all-left';
 
 export interface DiceResult {
   code: ResultCode;
   label: string;
   prize: PrizeKey | null;
   rankKey: RankKey;
+}
+
+/** 系统房规标识。只有开发者维护的两种，玩家不能提交自定义判奖逻辑。 */
+export type RulesetId = 'continuous' | 'high-tier-lock';
+
+/**
+ * 结束方式：默认奖品发完结束（无轮数上限）；固定轮数只允许 5／10／20。
+ * 判别联合，未知 mode 一律拒绝。
+ */
+export type EndCondition = { mode: 'all-prizes' } | { mode: 'rounds'; maxRounds: 5 | 10 | 20 };
+
+/** 六档奖品配置：count 为该档总份数（状元份数是同一位胜者所得，不是名额数），content 为可选展示文字。 */
+export type PrizeConfig = Record<PrizeKey, { count: number; content: string }>;
+
+/** 房间配置（创建时选择，等待室房主可改）。个人方案只保存 prizes 与 endCondition。 */
+export interface RoomConfig {
+  rulesetId: RulesetId;
+  endCondition: EndCondition;
+  prizes: PrizeConfig;
+}
+
+/**
+ * 系统房规快照：开局时随房间保存，不随系统预设更新而变化，也不能由请求覆盖。
+ * lockCodes 只对 `lock-high-tier` 生效。
+ */
+export interface RulesetSnapshot {
+  id: RulesetId;
+  version: 1;
+  name: string;
+  diceRulesVersion: 'unified-v1';
+  championPolicy: 'competitive' | 'lock-high-tier';
+  lockCodes: readonly ResultCode[];
 }
 
 export interface Player {
@@ -48,6 +87,10 @@ export interface Player {
   left: boolean;
   awards: Record<PrizeKey, number>;
   best: DiceResult | null;
+  /** 本局累计投掷次数（不受 240 条历史窗口裁剪影响）。 */
+  rollCount: number;
+  /** 本局累计超时跳过次数。 */
+  timeoutCount: number;
 }
 
 export interface RollRecord {
@@ -68,13 +111,18 @@ export interface Champion {
   result: DiceResult;
   dice: number[];
   at: number;
+  /** 高阶锁定版首次锁定后为 true；持续版始终为 false。 */
+  locked: boolean;
+  /** 触发锁定的牌型；未锁定为 null。 */
+  lockedBy: ResultCode | null;
 }
 
 export interface RoomState {
   code: string;
   name: string;
   maxPlayers: number;
-  maxRounds: 5 | 10 | 20;
+  config: RoomConfig;
+  ruleset: RulesetSnapshot;
   rulesVersion: 'unified-v1';
   status: RoomStatus;
   hostId: string;
@@ -87,11 +135,20 @@ export interface RoomState {
   deadline: number | null;
   paused: boolean;
   pool: Record<PrizeKey, number>;
+  /** 本局初始奖池（进度分母），来自本局 config，不随发放减少。 */
+  initialPool: Record<PrizeKey, number>;
   champion: Champion | null;
+  /** 已进入收尾的轮次；未进入收尾为 null。 */
+  closingRound: number | null;
+  /** 主动中止、全员离席关闭或离线过期导致的未完成。 */
+  incomplete: boolean;
+  /** 本次全员离线起点；有人在线时为 null（重启保留，不顺延）。 */
+  allOfflineSince: number | null;
   history: RollRecord[];
   finishedReason: FinishedReason | null;
   createdAt: number;
-  expiresAt: number;
+  /** 活跃对局为 null；全员离线起 24 小时，或状态转换起 24 小时。 */
+  expiresAt: number | null;
 }
 
 /** 成员凭证。只返回给创建者/加入者本人，绝不进入 RoomState、URL 或分享文本。 */
@@ -107,25 +164,33 @@ export type Action =
   | { type: 'roll'; requestId: string; expectedTurnId: string }
   | { type: 'leave' }
   | { type: 'end' }
-  | { type: 'rematch' };
+  | { type: 'rematch' }
+  | { type: 'update-config'; config: RoomConfig };
 
-/** 邀请落地页概况：只暴露房间概况，不含任何成员信息。 */
+/** 邀请落地页概况：只暴露房间概况，不含任何成员信息和凭证。 */
 export interface RoomPreview {
   code: string;
   name: string;
   playerCount: number;
   maxPlayers: number;
-  maxRounds: 5 | 10 | 20;
+  config: RoomConfig;
+  ruleset: RulesetSnapshot;
   status: RoomStatus;
   rulesVersion: 'unified-v1';
   canJoin: boolean;
+  expiresAt: number | null;
 }
 
+/**
+ * 创建房间请求。新客户端发送 config；旧客户端只发 maxRounds，由服务端显式适配为
+ * `{ mode: 'rounds', maxRounds }`。两者同时出现时拒绝，避免两套结束规则冲突。
+ */
 export interface CreateRoomRequest {
   nickname: string;
   name: string;
   maxPlayers: number;
-  maxRounds: 5 | 10 | 20;
+  config?: RoomConfig;
+  maxRounds?: 5 | 10 | 20;
 }
 
 export interface JoinRoomRequest {
