@@ -1,0 +1,42 @@
+# 月满博饼 · 单实例部署（Node 24 + SQLite 数据卷）
+#
+# 使用：PUBLIC_BASE_URL=https://bobing.example.com docker compose up -d --build
+#
+# 约束：
+#  - 只能有 1 个副本（SQLite 文件数据库 + 进程内房间缓存），不要使用 --scale 或 swarm 多副本；
+#    固定 container_name 也是为了避免误扩副本。
+#  - 数据卷必须持久化；删除卷等于清空全部房间与凭证。
+
+services:
+  bobing:
+    build:
+      context: .
+    image: bobing:0.1.0
+    container_name: bobing
+    restart: unless-stopped
+    ports:
+      # 默认只绑定本机，由反向代理对外提供 HTTPS/WSS；
+      # 如需局域网直连可改为 "3001:3001"（此时没有 HTTPS，分享链接也只能是 http://局域网IP:3001）
+      - '127.0.0.1:3001:3001'
+    environment:
+      PORT: '3001'
+      DATA_DIR: /app/data
+      # 分享链接使用的对外地址；必须在反向代理的域名上（http/https，不含凭证、查询串、片段）
+      PUBLIC_BASE_URL: '${PUBLIC_BASE_URL:-}'
+      # 经反向代理时启用，按 X-Forwarded-For 取客户端 IP 用于限流
+      TRUST_PROXY: '1'
+    volumes:
+      - bobing-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  bobing-data:

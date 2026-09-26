@@ -1,0 +1,33 @@
+# 依赖与构建产物
+node_modules/
+.npm-cache/
+dist/
+dist-server/
+coverage/
+
+# SQLite 数据目录（含 WAL/SHM），不得入库
+data/
+.e2e-data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# 环境变量（.env.example 保留在仓库中）
+.env
+.env.*
+!.env.example
+
+# 测试产物（E2E 截图 docs/screenshots 保留，便于审查）
+test-results/
+playwright-report/
+playwright/.cache/
+.playwright-mcp/
+*.png.tmp
+
+# 编辑器与系统
+.DS_Store
+*.log
+npm-debug.log*
+.idea/
+.vscode/
