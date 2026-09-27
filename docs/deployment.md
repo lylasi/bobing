@@ -1,7 +1,7 @@
 # 部署文档
 
 本文档面向把「月满博饼」放到真实环境运行的人。项目是**有状态单实例**应用：房间、回合、奖池和匿名凭证都存在进程使用的 SQLite 文件里，
-因此部署的核心是三件事——**只跑一个副本**、**数据卷持久化并正确备份**、**公网走 HTTPS 且 WebSocket 能升级**。
+因此部署的核心是三件事——**只跑一个副本**、**数据目录持久化并正确备份**、**公网走 HTTPS 且 WebSocket 能升级**。
 
 ---
 
@@ -62,7 +62,7 @@ PORT=3001 PUBLIC_BASE_URL=http://192.168.1.23:3001 npm start
 # 1) 配置对外地址（必须与浏览器实际访问的地址一致）
 export PUBLIC_BASE_URL=https://bobing.example.com
 
-# 2) 构建并启动（compose.yaml 已固定单实例 + 命名数据卷 + 健康检查）
+# 2) 构建并启动（compose.yaml 已固定单实例 + bind mount 数据目录 + 跟随 PORT 的健康检查）
 docker compose up -d --build
 
 # 3) 查看状态与日志
@@ -72,27 +72,30 @@ docker compose logs -f bobing
 
 要点：
 
-- `compose.yaml` 默认把端口绑定在 `127.0.0.1:3001`，由反向代理对外；要局域网直连可改成 `"3001:3001"`。
-- 数据卷 `bobing-data` 挂载到 `/app/data`。**删除该卷等于清空所有房间与凭证。**
-- 镜像使用 `node:24-bookworm-slim`，以非 root 用户 `node` 运行，`node:sqlite` 是 Node 24 内置模块，无需编译原生依赖。
-- 容器 `CMD` 直接运行 `dist-server/server/index.js`；宿主机的 `npm start` 会先跑 `prestart` 编译后端。
-- 需要绑定挂载到宿主目录时：
+- `compose.yaml` 把端口绑定在**所有网卡**（`0.0.0.0`），本机 `localhost:3001` 与局域网 `http://<局域网IP>:3001` 都能直接访问。只想暴露给反向代理时，把 `ports` 改成 `'127.0.0.1:${PORT:-3001}:${PORT:-3001}'`。
+- **换端口只需一个变量**：
 
-  ```yaml
-  volumes:
-    - ./data:/app/data
+  ```bash
+  PORT=8080 docker compose up -d --build
   ```
 
-  容器内用户 uid 为 1000，宿主目录需要先 `chown 1000:1000 ./data`，否则启动时会因权限不足无法建库。
+  宿主机映射、容器内监听、健康检查三处同步变化。
+- 局域网直连时，把 `PUBLIC_BASE_URL` 设成局域网地址（如 `http://192.168.1.23:3001`），否则从 `localhost` 打开页面时分享出去的链接也是 `localhost`，别人打不开；同时 `TRUST_PROXY` 必须为 `0`。
+- 数据以 **bind mount** 落在宿主机项目内的 `./data`（容器内 `/app/data`），可以直接用文件管理器查看、`cp` 备份、迁移。**清空该目录等于清空所有房间与凭证。**
+- 容器内用户 uid 为 1000（`node`）。macOS/Windows 的 Docker Desktop 会自动映射属主，通常开箱可用；**Linux 上**需先 `sudo mkdir -p data && sudo chown -R 1000:1000 data`，否则启动时会因权限不足无法建库。
+- 镜像使用 `node:24-bookworm-slim`，以非 root 用户 `node` 运行，`node:sqlite` 是 Node 24 内置模块，无需编译原生依赖。
+- 容器 `CMD` 直接运行 `dist-server/server/index.js`；宿主机的 `npm start` 会先跑 `prestart` 编译后端。
 
 ### 3.1 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PORT` | `3001` | 监听端口 |
-| `DATA_DIR` | `./data` | SQLite 目录；容器内建议 `/app/data` |
-| `PUBLIC_BASE_URL` | 空 | 分享地址。使用根域名的 http(s) 地址，例如 `https://bobing.example.com`；不含用户名、密码、查询串或片段。非法值会被忽略，结尾斜杠会去掉。当前应用不支持子路径部署 |
-| `TRUST_PROXY` | `0` | 前置代理时设为 `1`，按 `X-Forwarded-For` 计限流；直连公网时保持 `0`，否则客户端可伪造 IP 绕过限流 |
+| `PORT` | `3001` | 容器内监听端口，同时决定宿主机映射端口 |
+| `DATA_DIR` | `./data` | SQLite 目录；容器内固定为 `/app/data` |
+| `PUBLIC_BASE_URL` | 空 | 分享地址。必须是访问者能打开的 http(s) 绝对地址，例如反代的 `https://bobing.example.com` 或局域网直连的 `http://192.168.1.23:3001`；不含用户名、密码、查询串或片段。非法值会被忽略，结尾斜杠会去掉。当前应用不支持子路径部署 |
+| `TRUST_PROXY` | Docker 下 `1` | 前置反向代理时设为 `1`，按 `X-Forwarded-For` 计限流；**局域网/公网直连时必须为 `0`**，否则客户端可伪造该头绕过限流 |
+
+`docker compose` 会从项目根目录的 `.env` 读取 **`PORT`**、**`PUBLIC_BASE_URL`**、**`TRUST_PROXY`**；`DATA_DIR` 在 `compose.yaml` 内固定为 `/app/data`，不受 `.env` 影响。`npm start` 不读 `.env`，需用 `node --env-file=.env dist-server/server/index.js`。
 
 限流：创建/加入房间按 IP 每分钟 30 次，其余写操作按身份每分钟 120 次。
 
@@ -188,7 +191,9 @@ const { DatabaseSync, backup } = require("node:sqlite");
   console.log("备份完成:", target);
 })();
 '
-docker compose cp bobing:/app/data/backup-<时间戳>.sqlite ./backup.sqlite
+```
+
+`/app/data` 就是宿主机的 `./data`，备份文件直接出现在那里，**不需要 `docker compose cp`**。
 ```
 
 实测（本仓库容器内，一局 E2E 之后）：
@@ -214,9 +219,11 @@ docker compose exec bobing sqlite3 /app/data/bobing.sqlite ".backup '/app/data/b
 
 ### 5.3 停服冷备（简单可靠）
 
+默认 bind mount，直接复制宿主机目录（注意先停服，避免拷到写一半的 WAL）：
+
 ```bash
 docker compose stop bobing
-docker compose cp bobing:/app/data ./data-backup-$(date +%F)
+cp -a ./data ./data-backup-$(date +%F)
 docker compose start bobing
 ```
 
@@ -224,15 +231,16 @@ docker compose start bobing
 
 ### 5.4 恢复
 
+直接在宿主机上操作，容器与服务都不需要参与：
+
 ```bash
 docker compose stop bobing
-docker compose run --rm --no-deps --user root --entrypoint sh \
-  -v "$PWD/backup.sqlite:/backup.sqlite:ro" bobing \
-  -c 'rm -f /app/data/bobing.sqlite-wal /app/data/bobing.sqlite-shm; cp /backup.sqlite /app/data/bobing.sqlite; chown 1000:1000 /app/data/bobing.sqlite'
+rm -f ./data/bobing.sqlite-wal ./data/bobing.sqlite-shm
+cp ./backup.sqlite ./data/bobing.sqlite
 docker compose start bobing
 ```
 
-恢复前确认 `backup.sqlite` 是已验证的备份，并保留当前数据备份；此操作会覆盖当前数据库。使用 `docker compose run` 可挂载与正式服务相同的数据卷，避免把 Compose 自动加项目前缀的卷名误写成另一个卷。恢复后打开备份内的房间链接验证原身份和进度；超过24小时有效期的房间仍会过期。
+恢复前确认 `backup.sqlite` 是已验证的备份，并保留当前数据备份；此操作会覆盖当前数据库。**必须先删掉旧的 `-wal`/`-shm`**，否则新拷入的主库会被残留 WAL 回放污染。恢复后打开备份内的房间链接验证原身份和进度；超过24小时有效期的房间仍会过期。
 
 ### 5.5 保留策略与自动清理
 
@@ -269,10 +277,10 @@ docker compose logs -f bobing    # 确认启动日志中的监听地址与分享
 
 ## 8. 安全清单
 
-- [ ] 公网只暴露 443，3001 只监听 127.0.0.1 或容器网络内部。
+- [ ] 公网只暴露 443；若用反向代理，3001 只监听 `127.0.0.1`。
 - [ ] `PUBLIC_BASE_URL` 使用 https 域名，且与实际访问地址一致。
 - [ ] 反代设置 `X-Forwarded-For` 且 `TRUST_PROXY=1`；直连公网时 `TRUST_PROXY=0`。
-- [ ] 数据卷有备份且**演练过一次恢复**。
+- [ ] 数据目录 `./data` 有备份且**演练过一次恢复**。
 - [ ] 确认分享链接形如 `https://域名/room/ABC123`：只有 6 位房码，**没有 token、playerId 等查询参数**。
 - [ ] 不要在生产环境长期开启 `npm run dev`（Vite 开发服务器不具备生产性能与安全配置）。
 

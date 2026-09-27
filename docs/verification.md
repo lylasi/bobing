@@ -135,7 +135,7 @@ vite 代理 socket.io   = 200 :: 0{"sid":"uxgclm6KBgXat5LmAAAA","upgrades":["web
 ## 5. Docker 与 Compose
 
 ```text
-$ docker compose config          # 配置解析通过（端口绑定 127.0.0.1:3001、命名卷 bobing-data:/app/data、健康检查、PUBLIC_BASE_URL 透传）
+$ docker compose config          # 配置解析通过（端口绑定 0.0.0.0:${PORT}、bind mount ./data:/app/data、健康检查、PUBLIC_BASE_URL/TRUST_PROXY 透传）
 
 $ docker build -t bobing:0.1.0 .
 #18 exporting to image

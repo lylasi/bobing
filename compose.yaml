@@ -1,42 +1,41 @@
-# 月满博饼 · 单实例部署（Node 24 + SQLite 数据卷）
+# 月满博饼 · 单实例部署（Node 24 + SQLite，数据 bind mount 到宿主机 ./data）
 #
-# 使用：PUBLIC_BASE_URL=https://bobing.example.com docker compose up -d --build
+# 启动：PUBLIC_BASE_URL=https://bobing.example.com docker compose up -d --build
+# 换端口：PORT=8080 docker compose up -d --build
 #
 # 约束：
-#  - 只能有 1 个副本（SQLite 文件数据库 + 进程内房间缓存），不要使用 --scale 或 swarm 多副本；
-#    固定 container_name 也是为了避免误扩副本。
-#  - 数据卷必须持久化；删除卷等于清空全部房间与凭证。
+#  - 只能有 1 个副本（SQLite 文件库 + 进程内房间状态），不要用 --scale 或 swarm 多副本。
+#  - ./data 必须保留，清空它等于清空全部房间与凭证；目录内有 bobing.sqlite 及 -wal/-shm，
+#    备份不能只拷主库文件（停服后整体复制，或用应用内的备份接口）。
 
 services:
   bobing:
-    build:
-      context: .
+    build: .
     image: bobing:0.1.0
     container_name: bobing
     restart: unless-stopped
     ports:
-      # 默认只绑定本机，由反向代理对外提供 HTTPS/WSS；
-      # 如需局域网直连可改为 "3001:3001"（此时没有 HTTPS，分享链接也只能是 http://局域网IP:3001）
-      - '127.0.0.1:3001:3001'
+      # 绑定所有网卡，本机与局域网都能访问；只想允许反向代理访问则改成 '127.0.0.1:${PORT:-3001}:${PORT:-3001}'
+      - '${PORT:-3001}:${PORT:-3001}'
     environment:
-      PORT: '3001'
+      PORT: '${PORT:-3001}'
       DATA_DIR: /app/data
-      # 分享链接使用的对外地址；必须在反向代理的域名上（http/https，不含凭证、查询串、片段）
+      # 分享链接使用的对外地址，必须是反向代理的域名（http/https，不含凭证、查询串、片段）
       PUBLIC_BASE_URL: '${PUBLIC_BASE_URL:-}'
-      # 经反向代理时启用，按 X-Forwarded-For 取客户端 IP 用于限流
-      TRUST_PROXY: '1'
+      # 前置反向代理时为 1，按 X-Forwarded-For 取客户端 IP 用于限流；
+      # 局域网/公网直连时必须为 0，否则客户端可伪造该头绕过限流
+      TRUST_PROXY: '${TRUST_PROXY:-1}'
     volumes:
-      - bobing-data:/app/data
+      # 数据落到宿主机 ./data；Linux 上需先 sudo chown -R 1000:1000 data
+      - ./data:/app/data
     healthcheck:
       test:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        # 端口跟随 PORT 环境变量，避免改端口后健康检查打到旧端口
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-
-volumes:
-  bobing-data:

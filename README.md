@@ -66,10 +66,10 @@ npm start            # 运行构建产物，默认 http://localhost:3001（深�
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PORT` | `3001` | 服务端口，监听 `0.0.0.0`（同一局域网可访问） |
-| `DATA_DIR` | `./data` | SQLite 目录，包含 `bobing.sqlite` 与 WAL/SHM 文件；部署时必须挂载为持久化卷 |
-| `PUBLIC_BASE_URL` | 空 | 分享链接使用的对外地址。必须是 http(s) 绝对地址，且不含用户名/密码、查询串或片段；留空时前端使用访问者当前地址。通过只读接口 `GET /api/config` 下发给前端，不需要重新构建前端 |
-| `TRUST_PROXY` | `0` | 前置反向代理时设为 `1`，按 `X-Forwarded-For` 取客户端 IP 用于限流 |
+| `PORT` | `3001` | 服务端口，监听 `0.0.0.0`（同一局域网可访问）；docker compose 下同时决定宿主机映射端口 |
+| `DATA_DIR` | `./data` | SQLite 目录，包含 `bobing.sqlite` 与 WAL/SHM 文件；部署时必须挂载为持久化目录/卷 |
+| `PUBLIC_BASE_URL` | 空 | 分享链接使用的对外地址。必须是访问者能打开的 http(s) 绝对地址，且不含用户名/密码、查询串或片段；留空时前端使用访问者当前地址。通过只读接口 `GET /api/config` 下发给前端，不需要重新构建前端 |
+| `TRUST_PROXY` | `0`（docker compose 下默认 `1`） | 前置反向代理时设为 `1`，按 `X-Forwarded-For` 取客户端 IP 用于限流；直连时必须为 `0`，否则可伪造 IP 绕过限流 |
 
 `PUBLIC_BASE_URL` 与构建产物无关：运行时修改后重启进程即可生效（避免构建期与运行期配置混淆）。
 
@@ -170,19 +170,27 @@ tests/e2e/*.spec.ts    Playwright：两人对局用两个独立浏览器上下�
 
 ## 部署
 
-单实例 + 持久化数据卷的 Docker 部署：
+单实例 + 持久化数据目录的 Docker 部署：
 
 ```bash
-PUBLIC_BASE_URL=https://bobing.example.com docker compose up -d --build
+# 公网（反向代理 + HTTPS）
+PUBLIC_BASE_URL=https://bobing.example.com TRUST_PROXY=1 docker compose up -d --build
+
+# 局域网直连（无 HTTPS，连同一 Wi-Fi 的人可直接访问）
+PORT=7777 PUBLIC_BASE_URL=http://10.10.10.5:7777 TRUST_PROXY=0 docker compose up -d --build
 ```
 
 限制与注意（完整版见 [docs/deployment.md](docs/deployment.md)）：
 
 - **只能启动一个副本**：SQLite 文件数据库 + 进程内房间状态，多副本会互相覆盖。
-- 数据卷 `/app/data` 必须持久化；备份请用 SQLite 备份接口或停服后连同 `-wal`/`-shm` 一起复制。
+- 数据目录 `/app/data` 以 bind mount 落在宿主机 `./data`，可直接查看与备份。**清空该目录等于清空所有房间与凭证。**
+- 端口绑定在所有网卡，本机与局域网都可访问；换端口：`PORT=8080 docker compose up -d --build`。
+  只想允许反向代理访问时，把 `ports` 改成 `'127.0.0.1:${PORT:-3001}:${PORT:-3001}'`。
+- `PORT`、`PUBLIC_BASE_URL`、`TRUST_PROXY` 可写在项目根目录 `.env` 里，`docker compose` 会自动读取。
+- **直连（没套反向代理）时必须 `TRUST_PROXY=0`**，否则客户端可伪造 `X-Forwarded-For` 绕过限流。
 - 公网必须走 HTTPS，并在反向代理中转发 WebSocket 的 `Upgrade`/`Connection`。
 - 使用独立域名的根路径，当前不支持 `/bobing/` 等子路径部署。
-- `localhost` 只对本机有效，局域网 IP 只对同一网络有效；把它们当成可发给互联网好友的地址是错的。
+- `PUBLIC_BASE_URL` 必须是**访问者真能打开的地址**。留空时前端用访问者当前地址，从 `localhost` 打开就会分享出 `localhost` 链接给别人。
 - 正常关闭会保存暂停状态，重启后原身份重连可继续；异常退出且未保存暂停时，停机时间可能耗尽当前机会（见部署文档「已知限制」）。
 
 ## 验收与测试
