@@ -1,12 +1,13 @@
 /**
- * 房规配置、本机个人方案、等待室权限与准备重置、内容留空/自定义分母及再开局沿用的真实浏览器回归。
- * 覆盖 Spec A01、A08、A09、A10、A11 及主代理审查发现 4a。
+ * 房规配置、房间访问与停留秒数设置、数字码/旧码输入切换、单层六行奖品表、独立收起个人方案、
+ * 等待室权限与准备重置、内容留空/自定义分母及再开局沿用的真实浏览器回归。
  */
 
 import { expect, test } from '@playwright/test';
 import {
   expectNoHorizontalOverflow,
   joinByInvite,
+  paceForRateLimit,
   readInviteUrl,
   screenshot,
   startGame,
@@ -14,8 +15,8 @@ import {
   watchConsole,
 } from './helpers.js';
 
-test.describe('房规配置与本机个人方案', () => {
-  test('默认无限轮数、非法草稿不因编辑内容被重置(4a)、个人方案存取与配额失败提示、等待室改配与再开局沿用', async ({
+test.describe('房规配置、房间设置与本机个人方案', () => {
+  test('默认公开/允许旁观/停留1秒、非法停留草稿不静默回退、数字码与旧码切换、单层六行奖品与独立方案、等待室改配与再开局沿用', async ({
     browser,
   }) => {
     test.setTimeout(240_000);
@@ -29,6 +30,48 @@ test.describe('房规配置与本机个人方案', () => {
 
     try {
       await host.goto('/');
+
+      // —— 1. 首页游戏大厅入口 (/lobby) 与加入房间数字码/旧码键盘切换 ——
+      const lobbyLink = host.getByRole('link', { name: '游戏大厅' });
+      await expect(lobbyLink).toBeVisible();
+      await expect(lobbyLink).toHaveAttribute('href', '/lobby');
+
+      await host.getByRole('tab', { name: '加入房间' }).click();
+      const joinCodeInput = host.getByLabel('6位房间码');
+      const codeModeToggle = host.getByRole('button', { name: /输入含字母旧码|切换数字键盘/ });
+      await expect(joinCodeInput).toHaveAttribute('inputmode', 'numeric');
+      await expect(codeModeToggle).toHaveAttribute('aria-pressed', 'false');
+
+      // 六位数字码保留前导零
+      await joinCodeInput.fill('028416');
+      await expect(joinCodeInput).toHaveValue('028416');
+
+      // 粘贴含空白与小写字母的旧码：自动去空白并转大写，保留6位旧码
+      await joinCodeInput.fill(' abcd 23 ');
+      await expect(joinCodeInput).toHaveValue('ABCD23');
+
+      // 切换文本键盘入口
+      await codeModeToggle.click();
+      await expect(codeModeToggle).toHaveAttribute('aria-pressed', 'true');
+      await expect(joinCodeInput).toHaveAttribute('inputmode', 'text');
+      await codeModeToggle.click();
+      await expect(joinCodeInput).toHaveAttribute('inputmode', 'numeric');
+
+      // 切回创建房间
+      await host.getByRole('tab', { name: '创建房间' }).click();
+
+      // —— 2. 新房默认设置：大厅公开、允许旁观、结果停留 1 秒；系统房规与奖品默认 ——
+      const publicRadio = host.getByRole('radio', { name: '大厅公开' });
+      const inviteRadio = host.getByRole('radio', { name: '仅邀请' });
+      const spectatorCheckbox = host.getByRole('checkbox', { name: '允许旁观' });
+      const holdSecondsInput = host.getByRole('spinbutton', { name: '结果停留秒数', exact: true });
+      const createButton = host.getByRole('button', { name: '创建房间', exact: true });
+
+      await expect(publicRadio).toBeChecked();
+      await expect(inviteRadio).not.toBeChecked();
+      await expect(spectatorCheckbox).toBeChecked();
+      await expect(holdSecondsInput).toHaveValue('1');
+
       await expect(host.getByRole('radio', { name: '持续顶状元' })).toBeChecked();
       await expect(host.getByRole('radio', { name: '奖品发完结束' })).toBeChecked();
       await expect(host.locator('.config-summary-bar')).toContainText('默认共 63 份');
@@ -39,7 +82,42 @@ test.describe('房规配置与本机个人方案', () => {
       await host.getByLabel('你的昵称').fill('房主阿月');
       await host.getByLabel('房间名称').fill('自选奖品局');
 
-      // —— 首页初始状态：“调整奖品与个人方案”默认收起，点击目标 >= 44px ——
+      // —— 3. 结果停留秒数非法草稿校验：空白/小数/越界保留草稿并阻止提交，绝不静默还原为 1 ——
+      await holdSecondsInput.fill('');
+      await expect(holdSecondsInput).toHaveValue('');
+      await expect(host.getByRole('alert')).toContainText('请填写结果停留秒数');
+      await expect(createButton).toBeDisabled();
+
+      // 切换可见性与旁观开关时，空白草稿不得被重置为 1
+      await inviteRadio.check();
+      await spectatorCheckbox.uncheck();
+      await expect(holdSecondsInput).toHaveValue('');
+      await expect(createButton).toBeDisabled();
+
+      // 小数草稿 1.5：保留原值，报错并禁止提交
+      await holdSecondsInput.fill('1.5');
+      await expect(holdSecondsInput).toHaveValue('1.5');
+      await expect(host.getByRole('alert')).toContainText('结果停留秒数必须是 0–10 的整数');
+      await expect(createButton).toBeDisabled();
+
+      // 越界草稿 11：保留原值，报错并禁止提交
+      await holdSecondsInput.fill('11');
+      await expect(holdSecondsInput).toHaveValue('11');
+      await expect(host.getByRole('alert')).toContainText('结果停留秒数请填 0–10 的整数');
+      await expect(createButton).toBeDisabled();
+      await host.locator('#panel-create').evaluate((form: HTMLFormElement) => {
+        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      });
+      await expect(host).toHaveURL(/\/$/);
+
+      // 恢复有效停留秒数（2 秒），恢复公开与允许旁观
+      await holdSecondsInput.fill('2');
+      await publicRadio.check();
+      await spectatorCheckbox.check();
+      await expect(holdSecondsInput).toHaveValue('2');
+      await expect(createButton).toBeEnabled();
+
+      // —— 4. 首页初始状态：“调整奖品与个人方案”默认收起，点击目标 >= 44px ——
       const advancedToggle = host.getByRole('button', { name: '调整奖品与个人方案' });
       await expect(advancedToggle).toHaveAttribute('aria-expanded', 'false');
       const toggleBox = await advancedToggle.boundingBox();
@@ -47,36 +125,56 @@ test.describe('房规配置与本机个人方案', () => {
 
       const yixiuCountInput = host.getByLabel('一秀数量', { exact: true });
       const yixiuContentInput = host.getByLabel('一秀奖品内容', { exact: true });
-      const createButton = host.getByRole('button', { name: '创建房间', exact: true });
       await expect(yixiuCountInput).toBeHidden();
       await expect(host.getByLabel('个人方案名称')).toBeHidden();
 
-      // 先明确展开高级区再填写奖品与个人方案
+      // 展开奖品区：单层六行立即可见，“全部归最终状元”清楚标注，个人方案管理独立收起
       await advancedToggle.click();
       await expect(advancedToggle).toHaveAttribute('aria-expanded', 'true');
       await expect(yixiuCountInput).toBeVisible();
+      await expect(host.locator('.config-prize-item')).toHaveCount(6);
+      await expect(host.locator('.config-prize-badge')).toHaveText('全部归最终状元');
 
-      // —— 审查发现 4a + 单档同步回归：清空一秀数量后，无论编辑奖品内容还是修改另一档有效数量(状元=3)，非法空值都不得被重置回 32 ——
+      // 桌面端检验：单层六行每行三列（奖级、数量、内容在同一水平行）
+      const desktopRowLayout = await host.locator('.config-prize-item').first().evaluate((row) => {
+        const header = row.querySelector('.config-prize-header')!.getBoundingClientRect();
+        const count = row.querySelector('.config-prize-count-wrap')!.getBoundingClientRect();
+        const content = row.querySelector('.config-prize-content-wrap')!.getBoundingClientRect();
+        return {
+          headerLeft: header.left,
+          countLeft: count.left,
+          contentLeft: content.left,
+          sameBand: Math.abs(count.top - content.top) < 20 && header.right <= count.left + 2,
+        };
+      });
+      expect(desktopRowLayout.sameBand).toBe(true);
+      expect(desktopRowLayout.headerLeft).toBeLessThan(desktopRowLayout.countLeft);
+      expect(desktopRowLayout.countLeft).toBeLessThan(desktopRowLayout.contentLeft);
+
+      // 个人方案管理独立收起：展开奖品区后，个人方案默认仍是收起状态
+      const templatesToggle = host.getByRole('button', { name: '个人方案管理' });
+      await expect(templatesToggle).toHaveAttribute('aria-expanded', 'false');
+      await expect(host.getByLabel('个人方案名称')).toBeHidden();
+
+      // —— 审查发现 4a + 单档同步回归：清空一秀数量后，编辑内容或修改状元数量，非法空值绝不重置回 32 ——
       await yixiuCountInput.fill('');
       await expect(yixiuCountInput).toHaveValue('');
       await expect(host.getByRole('alert')).toContainText('请填写一秀数量');
       await expect(createButton).toBeDisabled();
 
-      // 继续编辑一秀奖品内容与状元奖品内容：一秀数量保持为空，且提交继续禁用
       await yixiuContentInput.fill('月饼一盒');
       await host.getByLabel('状元奖品内容', { exact: true }).fill('中秋特等团圆金礼盒（长文案展示不溢出测试）');
       await expect(yixiuCountInput).toHaveValue('');
       await expect(host.getByRole('alert')).toContainText('请填写一秀数量');
       await expect(createButton).toBeDisabled();
 
-      // 修改另一档（状元数量=3）触发有效 count 更新：一秀数量仍必须保持为空，绝不因循环同步被隐式恢复为 32
       await host.getByLabel('状元数量', { exact: true }).fill('3');
       await expect(host.getByLabel('状元数量', { exact: true })).toHaveValue('3');
       await expect(yixiuCountInput).toHaveValue('');
       await expect(host.getByRole('alert')).toContainText('请填写一秀数量');
       await expect(createButton).toBeDisabled();
 
-      // —— 收起高级区时：摘要反映草稿变化，非法字段绝不能因收起而绕过校验，再次展开保留全部草稿 ——
+      // 收起高级区时：摘要反映草稿变化，非法字段绝不能绕过校验，再次展开保留全部草稿
       await advancedToggle.click();
       await expect(advancedToggle).toHaveAttribute('aria-expanded', 'false');
       await expect(yixiuCountInput).toBeHidden();
@@ -104,7 +202,11 @@ test.describe('房规配置与本机个人方案', () => {
       );
       await expect(createButton).toBeEnabled();
 
-      // —— 个人方案保存、恢复默认数量、刷新后载入且不覆盖当前系统房规 ——
+      // —— 5. 展开独立的个人方案管理：保存、恢复默认数量、刷新后载入且不覆盖房规与公开/停留设置 ——
+      await templatesToggle.click();
+      await expect(templatesToggle).toHaveAttribute('aria-expanded', 'true');
+      await expect(host.getByLabel('个人方案名称')).toBeVisible();
+
       await host.getByLabel('个人方案名称').fill('中秋家宴方案');
       await host.getByRole('button', { name: '保存方案' }).click();
       await expect(host.getByRole('status')).toContainText('个人方案「中秋家宴方案」已保存在当前浏览器');
@@ -116,17 +218,23 @@ test.describe('房规配置与本机个人方案', () => {
       await expect(yixiuContentInput).toHaveValue('月饼一盒');
       await expect(host.getByRole('radio', { name: '高阶锁定' })).toBeChecked();
 
-      // 刷新首页，确认默认收起；重新选“高阶锁定”后展开并载入已保存方案：数量与内容恢复为 7 / 3，系统房规仍保持“高阶锁定”
+      // 刷新首页，确认默认收起；切到“仅邀请”+停留 3 秒 +“高阶锁定”，再展开并载入已保存方案：
+      // 数量与内容恢复为 7 / 3，但系统房规（高阶锁定）与房间设置（仅邀请、停留 3 秒）均保持不变！
       await host.reload();
       await expect(host.getByRole('button', { name: '调整奖品与个人方案' })).toHaveAttribute('aria-expanded', 'false');
+      await host.getByRole('radio', { name: '仅邀请' }).check();
+      await host.getByRole('spinbutton', { name: '结果停留秒数', exact: true }).fill('3');
       await host.getByRole('radio', { name: '高阶锁定' }).check();
+
       await host.getByRole('button', { name: '调整奖品与个人方案' }).click();
-      await expect(host.getByRole('button', { name: '调整奖品与个人方案' })).toHaveAttribute('aria-expanded', 'true');
+      await host.getByRole('button', { name: '个人方案管理' }).click();
       await host.getByLabel('已存个人方案').selectOption({ label: '中秋家宴方案' });
       await expect(host.getByLabel('一秀数量', { exact: true })).toHaveValue('7');
       await expect(host.getByLabel('状元数量', { exact: true })).toHaveValue('3');
       await expect(host.getByLabel('一秀奖品内容', { exact: true })).toHaveValue('月饼一盒');
       await expect(host.getByRole('radio', { name: '高阶锁定' })).toBeChecked();
+      await expect(host.getByRole('radio', { name: '仅邀请' })).toBeChecked();
+      await expect(host.getByRole('spinbutton', { name: '结果停留秒数', exact: true })).toHaveValue('3');
 
       // —— 存储不可用（QuotaExceededError）时绝不假报成功，但仍可正常开房 ——
       await host.evaluate(() => {
@@ -147,14 +255,51 @@ test.describe('房规配置与本机个人方案', () => {
         if (win.__origSetItem) Storage.prototype.setItem = win.__origSetItem;
       });
 
-      // 重新填写昵称与房间名称并创建房间
+      // 手机 375px 下验证每档两行（第1行奖级+数量，第2行奖品内容全宽）且无横向溢出
+      await host.setViewportSize({ width: 375, height: 812 });
+      const mobileRowLayout = await host.locator('.config-prize-item').first().evaluate((row) => {
+        const header = row.querySelector('.config-prize-header')!.getBoundingClientRect();
+        const count = row.querySelector('.config-prize-count-wrap')!.getBoundingClientRect();
+        const content = row.querySelector('.config-prize-content-wrap')!.getBoundingClientRect();
+        return {
+          headerAndCountSameRow: Math.abs(header.top - count.top) < 16 && header.left < count.left,
+          contentBelowRow1: count.bottom <= content.top + 2 && header.bottom <= content.top + 6,
+          contentWiderThanCount: content.width > count.width * 1.5,
+        };
+      });
+      expect(mobileRowLayout.headerAndCountSameRow).toBe(true);
+      expect(mobileRowLayout.contentBelowRow1).toBe(true);
+      expect(mobileRowLayout.contentWiderThanCount).toBe(true);
+      await expectNoHorizontalOverflow(host);
+      await host.setViewportSize({ width: 1440, height: 900 });
+
+      // 重新填写昵称与房间名称，设置为“大厅公开 + 允许旁观 + 停留 1 秒”，拦截校验 createRoom 请求体带 access 和 pacing
+      await host.getByRole('radio', { name: '大厅公开' }).check();
+      await host.getByRole('checkbox', { name: '允许旁观' }).check();
+      await host.getByRole('spinbutton', { name: '结果停留秒数', exact: true }).fill('1');
       await host.getByLabel('你的昵称').fill('房主阿月');
       await host.getByLabel('房间名称').fill('自选奖品局');
       await expectNoHorizontalOverflow(host);
       await screenshot(host, '40-home-config-1440');
 
+      const createRequestPromise = host.waitForRequest(
+        (req) => req.method() === 'POST' && req.url().endsWith('/api/rooms'),
+      );
+
+      await paceForRateLimit();
       await createButton.click();
+      const createRequest = await createRequestPromise;
       await expect(host).toHaveURL(/\/room\/[A-Z0-9]{6}$/);
+
+      const capturedCreatePayload = createRequest.postDataJSON() as Record<string, unknown> | null;
+      expect(capturedCreatePayload).not.toBeNull();
+      expect(capturedCreatePayload?.access).toEqual({
+        visibility: 'public',
+        allowSpectators: true,
+      });
+      expect(capturedCreatePayload?.pacing).toEqual({
+        resultHoldSeconds: 1,
+      });
 
       // 等待室显示高阶锁定、奖品发完结束、填写的内容；未填内容的档位不渲染 .prize-content
       await expect(host.getByText('高阶锁定').first()).toBeVisible();
@@ -174,7 +319,7 @@ test.describe('房规配置与本机个人方案', () => {
       await toggleReady(guest);
       await expect(host.locator('.player-ready')).toHaveCount(2);
 
-      // 房主打开配置弹层：默认展开全部编辑字段（无需再点一次展开），并验证保存失败时保留草稿提示错误
+      // 房主打开配置弹层：默认展开六档奖品区（defaultAdvancedOpen），个人方案管理独立收起
       await host.getByRole('button', { name: '修改房规与奖品' }).click();
       const dialog = host.getByRole('dialog', { name: '修改房规与奖品' });
       await expect(dialog).toBeVisible();
@@ -182,7 +327,8 @@ test.describe('房规配置与本机个人方案', () => {
       await expect(dialog.getByRole('button', { name: '调整奖品与个人方案' })).toHaveAttribute('aria-expanded', 'true');
       await expect(dialog.getByLabel('对堂数量', { exact: true })).toBeVisible();
       await expect(dialog.getByLabel('对堂奖品内容', { exact: true })).toBeVisible();
-      await expect(dialog.getByLabel('个人方案名称')).toBeVisible();
+      await expect(dialog.getByRole('button', { name: '个人方案管理' })).toHaveAttribute('aria-expanded', 'false');
+      await expect(dialog.getByLabel('个人方案名称')).toBeHidden();
       await screenshot(host, '41-waiting-edit-dialog-1440');
 
       await dialog.getByLabel('对堂数量', { exact: true }).fill('5');
@@ -249,7 +395,14 @@ test.describe('房规配置与本机个人方案', () => {
       });
       await expect(host.locator('.prize-pool')).toContainText('武夷岩茶一盒');
 
-      // 房主提前结束并再开一局：验证结算显示“本局未完成”，再开一局后沿用本房间配置并清空统计
+      // 房主提前结束并再开一局：先打开“更多”面板再点击“提前结束”
+      const moreBtn = host.getByRole('button', { name: /更多/ });
+      if (await moreBtn.isVisible()) {
+        const isExpanded = (await moreBtn.getAttribute('aria-expanded')) === 'true';
+        if (!isExpanded) {
+          await moreBtn.click();
+        }
+      }
       await host.getByRole('button', { name: '提前结束' }).click();
       await host.getByRole('dialog', { name: '提前结束本局？' }).getByRole('button', { name: '确认结束' }).click();
       await expect(host.getByText('本局未完成')).toBeVisible({ timeout: 20_000 });

@@ -10,10 +10,15 @@
 import express from 'express';
 import type { Express, NextFunction, Request, Response } from 'express';
 import { ERROR_MESSAGES } from '../shared/types.js';
-import type { Action, ErrorCode, RoomConfig } from '../shared/types.js';
+import type { Action, ErrorCode, LobbyQuery, RoomAccess, RoomConfig, RoomPacing } from '../shared/types.js';
 import { RoomService, ServiceError, isUuid } from './room-service.js';
 
 export const MAX_BODY_BYTES = 16 * 1024;
+
+/** 大厅分页默认值与上限。 */
+export const LOBBY_DEFAULT_LIMIT = 20;
+export const LOBBY_MAX_LIMIT = 50;
+const LOBBY_FILTERS = ['joinable', 'all', 'playing'] as const;
 
 export interface AppOptions {
   /** 生产环境下 Express 提供构建后的静态文件与 SPA 回退；测试不传。 */
@@ -114,9 +119,57 @@ export function parseAction(body: Record<string, unknown>): Action {
       }
       return { type: 'update-config', config: config as RoomConfig };
     }
+    case 'update-pacing': {
+      // 完整校验交给 shared/presentation.normalizeRoomPacing（省略与非法显式配置分开处理）
+      if (typeof body.pacing !== 'object' || body.pacing === null || Array.isArray(body.pacing)) {
+        fail('INVALID_INPUT', 'pacing 必须是房间节奏对象');
+      }
+      return { type: 'update-pacing', pacing: body.pacing as RoomPacing };
+    }
+    case 'update-access': {
+      if (typeof body.access !== 'object' || body.access === null || Array.isArray(body.access)) {
+        fail('INVALID_INPUT', 'access 必须是房间访问设置对象');
+      }
+      return { type: 'update-access', access: body.access as RoomAccess };
+    }
     default:
       fail('INVALID_INPUT', '未知的操作类型');
   }
+}
+
+/**
+ * 解析大厅查询参数：filter 默认 joinable，limit 默认 20（1–50），cursor 默认 null。
+ * 除空字符串以外的非法 cursor（非 base64url、字段不合法）由服务层按 INVALID_INPUT 拒绝。
+ */
+export function parseLobbyQuery(query: Request['query']): LobbyQuery {
+  const rawFilter = query.filter;
+  const rawLimit = query.limit;
+  const rawCursor = query.cursor;
+
+  let filter: LobbyQuery['filter'] = 'joinable';
+  if (rawFilter !== undefined) {
+    if (typeof rawFilter !== 'string' || !(LOBBY_FILTERS as readonly string[]).includes(rawFilter)) {
+      fail('INVALID_INPUT', 'filter 只能是 joinable、all 或 playing');
+    }
+    filter = rawFilter as LobbyQuery['filter'];
+  }
+
+  let limit = LOBBY_DEFAULT_LIMIT;
+  if (rawLimit !== undefined) {
+    if (typeof rawLimit !== 'string' || !/^[0-9]+$/.test(rawLimit)) {
+      fail('INVALID_INPUT', 'limit 必须是 1–50 的整数');
+    }
+    limit = Number.parseInt(rawLimit, 10);
+    if (limit < 1 || limit > LOBBY_MAX_LIMIT) fail('INVALID_INPUT', 'limit 必须是 1–50 的整数');
+  }
+
+  let cursor: string | null = null;
+  if (rawCursor !== undefined) {
+    if (typeof rawCursor !== 'string') fail('INVALID_INPUT', 'cursor 必须是字符串');
+    cursor = rawCursor.length === 0 ? null : rawCursor;
+  }
+
+  return { filter, limit, cursor };
 }
 
 export function createApp(service: RoomService, options: AppOptions = {}): Express {
@@ -156,6 +209,8 @@ export function createApp(service: RoomService, options: AppOptions = {}): Expre
           maxPlayers: body.maxPlayers,
           config: body.config,
           maxRounds: body.maxRounds,
+          pacing: body.pacing,
+          access: body.access,
         },
         clientIp(req),
       );
@@ -165,9 +220,27 @@ export function createApp(service: RoomService, options: AppOptions = {}): Expre
     }
   });
 
+  // 大厅列表：默认 filter=joinable、limit=20；只列公开、未过期、waiting／playing 的房间
+  app.get('/api/rooms', (req, res) => {
+    try {
+      res.status(200).json(service.listLobby(parseLobbyQuery(req.query)));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
   app.get('/api/rooms/:code', (req, res) => {
     try {
       res.status(200).json(service.preview(String(req.params.code ?? '')));
+    } catch (error) {
+      sendError(res, error);
+    }
+  });
+
+  // 只读旁观入口：不需要成员凭证，不改变任何成员在线状态或到期时间
+  app.get('/api/rooms/:code/watch', (req, res) => {
+    try {
+      res.status(200).json({ room: service.watch(String(req.params.code ?? '')) });
     } catch (error) {
       sendError(res, error);
     }

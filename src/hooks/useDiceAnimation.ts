@@ -12,12 +12,14 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
+import { DICE_REVEAL_MS } from '../../shared/presentation.js';
 import type { RoomState, RollRecord } from '../../shared/types.js';
+import { serverNow } from '../lib/api.js';
 
 export type DicePhase = 'idle' | 'tumbling' | 'landing' | 'colliding' | 'settling';
 
-const TOTAL_ANIMATION_MS = 750;
-const FRAME_MS = 75;
+const TOTAL_ANIMATION_MS = DICE_REVEAL_MS;
+const FRAME_MS = 50;
 
 function prefersReducedMotion(): boolean {
   if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
@@ -93,16 +95,22 @@ export function useDiceAnimation(
   const authorityKeyRef = useRef('');
   const latestKeyRef = useRef('');
   const armedRollRef = useRef(false);
+  const armedAtRef = useRef<number | null>(null);
+  const armedServerNowRef = useRef<number | null>(null);
   const prevRollPendingRef = useRef(false);
   const rollStartKeyRef = useRef<string | null>(null);
   const revealTimerRef = useRef<number | null>(null);
   const pendingTimerRef = useRef<number | null>(null);
+  const roomRef = useRef<RoomState | null>(room);
 
+  roomRef.current = room;
   authorityKeyRef.current = authorityKey;
   latestKeyRef.current = latestKey;
   if (rollPending && !prevRollPendingRef.current) {
     armedRollRef.current = true;
     rollStartKeyRef.current = latestKey;
+    armedAtRef.current = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    armedServerNowRef.current = serverNow();
   }
   prevRollPendingRef.current = rollPending;
 
@@ -138,6 +146,8 @@ export function useDiceAnimation(
       hydratedGameRef.current = gameNumber;
       appliedKeyRef.current = latestKey;
       armedRollRef.current = false;
+      armedAtRef.current = null;
+      armedServerNowRef.current = null;
       rollStartKeyRef.current = null;
       clearAllTimers();
       setDice(authoritative);
@@ -153,6 +163,8 @@ export function useDiceAnimation(
       hydratedGameRef.current = gameNumber;
       appliedKeyRef.current = latestKey;
       armedRollRef.current = false;
+      armedAtRef.current = null;
+      armedServerNowRef.current = null;
       rollStartKeyRef.current = null;
       clearAllTimers();
       if (history.length === 0) {
@@ -183,6 +195,8 @@ export function useDiceAnimation(
     // 超时记录没有骰子：只更新文案，碗里保留上一手权威点数
     if (latestReason === 'timeout') {
       armedRollRef.current = false;
+      armedAtRef.current = null;
+      armedServerNowRef.current = null;
       rollStartKeyRef.current = null;
       const authoritative = authorityKey.length > 0 ? authorityKey.split(',').map(Number) : null;
       setDice(authoritative);
@@ -196,6 +210,8 @@ export function useDiceAnimation(
     // 别人的投掷：两端立即显示服务端权威点数，无动画
     if (!latestIsMine) {
       armedRollRef.current = false;
+      armedAtRef.current = null;
+      armedServerNowRef.current = null;
       rollStartKeyRef.current = null;
       setDice(latest.dice);
       setSpinning(false);
@@ -207,7 +223,11 @@ export function useDiceAnimation(
 
     // 本人的投掷：只有本机主动发起（wasArmed）且未开启减少动态效果才播放分阶段动画
     const wasArmed = armedRollRef.current;
+    const armedAt = armedAtRef.current;
+    const armedServerNow = armedServerNowRef.current;
     armedRollRef.current = false;
+    armedAtRef.current = null;
+    armedServerNowRef.current = null;
     rollStartKeyRef.current = null;
 
     if (!wasArmed || prefersReducedMotion()) {
@@ -219,16 +239,71 @@ export function useDiceAnimation(
       return undefined;
     }
 
+    // 服务端展示阶段校验与追赶：
+    // 本地主动发起的投掷，以本地单调时钟计算自发起以来的已消耗上限 elapsedSinceArmed；
+    // 发起投掷时捕获当时的 serverNow()，动画耗时估算基于该发起前快照 + 本地单调经过时长，
+    // 避免延迟到达的 HTTP 响应在校时时因往返不对称反向重置动画时钟；
+    // 仍以上限 elapsedSinceArmed 为界进行修正，防止粗粒度时钟造成伪迟到或伪快进。
+    const presentation = room?.presentation ?? null;
+    const isPaused = room?.paused ?? false;
+    const isSuperseded = presentation !== null && presentation.recordId !== latest.id;
+    const nowMonotonic = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const elapsedSinceArmed = armedAt !== null ? Math.max(0, nowMonotonic - armedAt) : TOTAL_ANIMATION_MS;
+    const currentServerTime =
+      armedServerNow !== null && armedAt !== null ? armedServerNow + elapsedSinceArmed : serverNow();
+    const serverElapsed = Math.max(0, currentServerTime - latest.at);
+    // 粗粒度校时下，自服务端掷骰以来的耗时以上限 elapsedSinceArmed 为界进行修正
+    const elapsedSinceRoll = Math.min(serverElapsed, elapsedSinceArmed);
+
+    const isPresentationExpired =
+      presentation === null ||
+      (presentation.until !== null &&
+        currentServerTime >= presentation.until &&
+        elapsedSinceArmed >= TOTAL_ANIMATION_MS);
+    const isAnimationExpired = elapsedSinceRoll >= TOTAL_ANIMATION_MS || elapsedSinceArmed >= TOTAL_ANIMATION_MS;
+
+    if (isPaused || isSuperseded || isPresentationExpired || isAnimationExpired) {
+      setDice(latest.dice);
+      setSpinning(false);
+      setPhase('idle');
+      setSettledCount(6);
+      setRevealed(latest);
+      return undefined;
+    }
+
     const targetDice = latest.dice;
-    let elapsed = 0;
+    const animStartTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const initialElapsed = elapsedSinceRoll;
+    const initialStage = stageForElapsed(initialElapsed);
     setSpinning(true);
-    setPhase('tumbling');
-    setSettledCount(0);
-    setDice(mixedFaces(targetDice, 0));
+    setPhase(initialStage.phase);
+    setSettledCount(initialStage.settledCount);
+    setDice(mixedFaces(targetDice, initialStage.settledCount));
 
     const timer = window.setInterval(() => {
-      elapsed += FRAME_MS;
-      if (elapsed >= TOTAL_ANIMATION_MS) {
+      const currentRoom = roomRef.current;
+      const isCurrentlyPaused = currentRoom?.paused ?? false;
+      const currentPresentation = currentRoom?.presentation ?? null;
+      const isCurrentlySuperseded = currentPresentation !== null && currentPresentation.recordId !== latest.id;
+      const currentNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const currentEstimatedServerNow =
+        armedServerNow !== null && armedAt !== null
+          ? armedServerNow + Math.max(0, currentNow - armedAt)
+          : serverNow();
+      const isCurrentlyPresentationExpired =
+        currentPresentation === null ||
+        (currentPresentation.until !== null &&
+          currentEstimatedServerNow >= currentPresentation.until &&
+          currentNow - animStartTime >= TOTAL_ANIMATION_MS);
+
+      const currentElapsed = initialElapsed + Math.max(0, currentNow - animStartTime);
+
+      if (
+        isCurrentlyPaused ||
+        isCurrentlySuperseded ||
+        isCurrentlyPresentationExpired ||
+        currentElapsed >= TOTAL_ANIMATION_MS
+      ) {
         window.clearInterval(timer);
         if (revealTimerRef.current === timer) revealTimerRef.current = null;
         setDice(targetDice);
@@ -238,7 +313,8 @@ export function useDiceAnimation(
         setRevealed(latest);
         return;
       }
-      const nextStage = stageForElapsed(elapsed);
+
+      const nextStage = stageForElapsed(currentElapsed);
       setPhase(nextStage.phase);
       setSettledCount(nextStage.settledCount);
       setDice(mixedFaces(targetDice, nextStage.settledCount));
@@ -246,7 +322,37 @@ export function useDiceAnimation(
 
     revealTimerRef.current = timer;
     return undefined;
-  }, [hasRoom, gameNumber, latestKey, latestReason, latestDiceKey, latestIsMine, authorityKey, latest]);
+  }, [
+    hasRoom,
+    gameNumber,
+    latestKey,
+    latestReason,
+    latestDiceKey,
+    latestIsMine,
+    authorityKey,
+    latest,
+    room?.presentation?.recordId,
+    room?.presentation?.until,
+    room?.paused,
+  ]);
+
+  // 正在进行动画时，若房间被暂停、展示被取消或被更新的记录取代，立即中止动画并呈现权威停稳结果
+  useEffect(() => {
+    if (revealTimerRef.current === null) return;
+    const isPaused = room?.paused ?? false;
+    const presentation = room?.presentation ?? null;
+    const isSuperseded = presentation !== null && latest !== null && presentation.recordId !== latest.id;
+
+    if (isPaused || isSuperseded || presentation === null) {
+      clearRevealTimer();
+      const authoritative = latest?.dice ?? (authorityKeyRef.current.length > 0 ? authorityKeyRef.current.split(',').map(Number) : null);
+      setDice(authoritative);
+      setSpinning(false);
+      setPhase('idle');
+      setSettledCount(authoritative ? 6 : 0);
+      setRevealed(latest);
+    }
+  }, [room?.paused, room?.presentation?.recordId, room?.presentation, latest]);
 
   // 3) 本机发起投掷请求：在等待响应期间显示 tumbling 装饰帧；若请求结束仍无新结果则恢复上一手权威点数
   useEffect(() => {
@@ -254,6 +360,12 @@ export function useDiceAnimation(
       armedRollRef.current = true;
       if (rollStartKeyRef.current === null) {
         rollStartKeyRef.current = latestKeyRef.current;
+      }
+      if (armedAtRef.current === null) {
+        armedAtRef.current = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      }
+      if (armedServerNowRef.current === null) {
+        armedServerNowRef.current = serverNow();
       }
       clearPendingTimer();
 
@@ -291,6 +403,8 @@ export function useDiceAnimation(
     if (startedFrom !== null && latestKeyRef.current === startedFrom && appliedKeyRef.current === startedFrom) {
       // 请求结束但没有产生新记录（网络失败/超时未受理）：立即停止旋转，恢复权威点数
       armedRollRef.current = false;
+      armedAtRef.current = null;
+      armedServerNowRef.current = null;
       clearRevealTimer();
       const authoritative = authorityKeyRef.current.length > 0 ? authorityKeyRef.current.split(',').map(Number) : null;
       setDice(authoritative);

@@ -1,22 +1,29 @@
 /**
- * 房间页编排：邀请落地 → 等待区 → 对局区 → 结算区，以及分享/规则/确认三个弹层。
+ * 房间页编排：邀请落地 → 等待区 → 对局区 → 结算区，以及旁观视图（`/room/:code/watch`）、
+ * 房间设置弹层（RoomSettingsDialog）、分享/规则/确认弹层。
  *
- * 身份恢复：本浏览器存有该房间凭证时直接以成员身份进入（先 GET 权威快照再订阅）；
- * 凭证失效只清理当前房间的记录，并回到落地页说明原因。
+ * 身份恢复规则：
+ * - 本浏览器存有该房间有效凭证时（不论访问 `/room/:code` 还是 `/room/:code/watch`），
+ *   始终优先恢复成员身份进入 MemberView；
+ * - 凭证失效（INVALID_TOKEN）只清理当前房间的记录：若原路径为 `/room/:code` 则回到落地页说明原因，
+ *   若原路径为 `/room/:code/watch` 则平滑降级为只读观众视图；
+ * - 观众在等待室点击“我要入座”加入成功后，保存成员凭证并无缝切入 MemberView。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
-import type { Membership } from '../../shared/types.js';
+import type { Membership, RoomAccess, RoomPacing } from '../../shared/types.js';
 import { ConfirmDialog } from '../components/ConfirmDialog.js';
 import { Dialog } from '../components/Dialog.js';
 import { GameBoard } from '../components/GameBoard.js';
 import { Results } from '../components/Results.js';
 import { RoomHeader } from '../components/RoomHeader.js';
 import { RoomLanding } from '../components/RoomLanding.js';
+import { RoomSettingsDialog } from '../components/RoomSettingsDialog.js';
 import { RulesContent } from '../components/RulesContent.js';
 import { ShareDialog } from '../components/ShareDialog.js';
 import { SiteHeader } from '../components/SiteHeader.js';
+import { SpectatorRoom } from '../components/SpectatorRoom.js';
 import { WaitingRoom } from '../components/WaitingRoom.js';
 import { useDiceAnimation } from '../hooks/useDiceAnimation.js';
 import { useRoom } from '../hooks/useRoom.js';
@@ -32,11 +39,37 @@ interface MemberViewProps {
   membership: Membership;
   onInvalid: (message: string) => void;
   onLeft: () => void;
+  onAuthenticated?: () => void;
+  watchIntent?: boolean;
+  onFallbackToWatch?: () => void;
 }
 
-function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): ReactElement {
-  const { room, playerId, loading, fatal, loadError, retry, connection, actionMessage, clearActionMessage, busy, rollPending, now, runAction, roll } =
-    useRoom(code, membership.token);
+function MemberView({
+  code,
+  membership,
+  onInvalid,
+  onLeft,
+  onAuthenticated,
+  watchIntent,
+  onFallbackToWatch,
+}: MemberViewProps): ReactElement {
+  const {
+    room,
+    playerId,
+    loading,
+    fatal,
+    loadError,
+    retry,
+    connection,
+    viewerCount,
+    actionMessage,
+    clearActionMessage,
+    busy,
+    rollPending,
+    now,
+    runAction,
+    roll,
+  } = useRoom(code, membership.token);
   const { dice, spinning, revealed, phase, settledCount } = useDiceAnimation(room, playerId, rollPending);
   const { enabled: soundEnabled, setEnabled: setSoundEnabled } = useSoundSettings();
 
@@ -67,6 +100,9 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
 
   const [shareOpen, setShareOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<'end' | 'leave' | null>(null);
   const [leaveError, setLeaveError] = useState<string | null>(null);
 
@@ -75,6 +111,12 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
   useEffect(() => {
     if (fatal?.code === 'INVALID_TOKEN') onInvalid(fatal.message);
   }, [fatal, onInvalid]);
+
+  useEffect(() => {
+    if (room && !loadError && !fatal) {
+      onAuthenticated?.();
+    }
+  }, [room, loadError, fatal, onAuthenticated]);
 
   const inviteUrl = useInviteUrl(code);
   const isHost = room?.hostId === playerId;
@@ -89,18 +131,59 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
     }
   }, [soundEnabled, setSoundEnabled, getSound]);
 
+  const handleSaveSettings = useCallback(
+    async (nextPacing: RoomPacing, nextAccess: RoomAccess): Promise<void> => {
+      if (!room) return;
+      setSettingsSaving(true);
+      setSettingsError(null);
+      try {
+        const pacingChanged = nextPacing.resultHoldSeconds !== room.pacing.resultHoldSeconds;
+        const accessChanged =
+          nextAccess.visibility !== room.access.visibility ||
+          nextAccess.allowSpectators !== room.access.allowSpectators;
+
+        if (pacingChanged || !accessChanged) {
+          const pacingOutcome = await runAction({ type: 'update-pacing', pacing: nextPacing });
+          if (!pacingOutcome.ok) {
+            const msg = pacingOutcome.error?.message ?? '保存游戏节奏设置失败，请重试';
+            setSettingsError(msg);
+            throw pacingOutcome.error ?? new Error(msg);
+          }
+        }
+
+        if (accessChanged) {
+          const accessOutcome = await runAction({ type: 'update-access', access: nextAccess });
+          if (!accessOutcome.ok) {
+            const msg = accessOutcome.error?.message ?? '保存房间访问设置失败，请重试';
+            setSettingsError(msg);
+            throw accessOutcome.error ?? new Error(msg);
+          }
+        }
+
+        setSettingsError(null);
+      } finally {
+        setSettingsSaving(false);
+      }
+    },
+    [room, runAction],
+  );
+
   const handleRoll = useCallback((): void => {
     if (
-      soundEnabled &&
-      room &&
-      room.status === 'playing' &&
-      room.turnId &&
-      room.turnPlayerId === playerId &&
-      connection === 'connected' &&
-      !rollPending &&
-      !spinning &&
-      !room.paused
+      !room ||
+      room.status !== 'playing' ||
+      !room.turnId ||
+      room.turnPlayerId !== playerId ||
+      room.presentation !== null ||
+      room.deadline === null ||
+      connection !== 'connected' ||
+      rollPending ||
+      spinning ||
+      room.paused
     ) {
+      return;
+    }
+    if (soundEnabled) {
       const sound = getSound();
       void sound.unlock();
       sound.start();
@@ -159,6 +242,11 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
             <button type="button" className="btn btn-primary" onClick={retry}>
               重试
             </button>
+            {watchIntent && onFallbackToWatch ? (
+              <button type="button" className="btn btn-secondary" onClick={onFallbackToWatch}>
+                以观众身份先看看
+              </button>
+            ) : null}
             <Link className="btn btn-secondary" to="/">
               回首页
             </Link>
@@ -196,9 +284,14 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
         isHost={Boolean(isHost)}
         showHostEnd={room.status === 'playing'}
         soundEnabled={soundEnabled}
+        viewerCount={viewerCount}
         onToggleSound={handleToggleSound}
         onInvite={() => setShareOpen(true)}
         onRules={() => setRulesOpen(true)}
+        onOpenSettings={() => {
+          setSettingsError(null);
+          setSettingsOpen(true);
+        }}
         onEndRequest={() => setConfirm('end')}
         onLeaveRequest={() => setConfirm('leave')}
       />
@@ -271,6 +364,15 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
         <RulesContent compact room={room} />
       </Dialog>
 
+      <RoomSettingsDialog
+        room={room}
+        open={settingsOpen}
+        saving={settingsSaving}
+        error={settingsError}
+        onClose={() => setSettingsOpen(false)}
+        onSave={handleSaveSettings}
+      />
+
       <ConfirmDialog
         open={confirm === 'end'}
         title="提前结束本局？"
@@ -304,28 +406,53 @@ function MemberView({ code, membership, onInvalid, onLeft }: MemberViewProps): R
   );
 }
 
-export function Room({ code }: { code: string }): ReactElement {
+export function Room({
+  code,
+  mode = 'member',
+}: {
+  code: string;
+  mode?: 'member' | 'spectate';
+}): ReactElement {
   const [membership, setMembership] = useState<Membership | null>(() => loadMembership(code));
   const [notice, setNotice] = useState<string | null>(null);
+  const [fallbackToSpectate, setFallbackToSpectate] = useState(false);
   useTitle('月满博饼 · 房间');
 
   useEffect(() => {
     setMembership(loadMembership(code));
     setNotice(null);
+    setFallbackToSpectate(false);
   }, [code]);
+
+  // 当访问 /room/:code/watch 且服务端确认有效成员身份（MemberView 中 room 已就绪）时，URL 同步恢复为成员路由
+  const handleAuthenticated = useCallback((): void => {
+    if (mode === 'spectate') {
+      navigate(`/room/${code}`, { replace: true });
+    }
+  }, [mode, code]);
 
   const handleInvalid = useCallback(
     (message: string): void => {
       clearMembership(code);
       setMembership(null);
-      setNotice(`${message}（这台设备上原来的入席记录已清除，重新输入昵称即可入席）`);
+      if (mode === 'member') {
+        setNotice(`${message}（这台设备上原来的入席记录已清除，重新输入昵称即可入席）`);
+      }
     },
-    [code],
+    [code, mode],
   );
 
   const handleLeft = useCallback((): void => {
     navigate('/');
   }, []);
+
+  const handleSpectatorJoined = useCallback(
+    (joined: Membership): void => {
+      setMembership(joined);
+      navigate(`/room/${code}`, { replace: true });
+    },
+    [code],
+  );
 
   if (!isValidRoomCode(code)) {
     return (
@@ -350,8 +477,19 @@ export function Room({ code }: { code: string }): ReactElement {
     <div className="page">
       <SiteHeader />
       <main className="container room-main">
-        {membership ? (
-          <MemberView key={`${code}:${membership.playerId}`} code={code} membership={membership} onInvalid={handleInvalid} onLeft={handleLeft} />
+        {membership && !fallbackToSpectate ? (
+          <MemberView
+            key={`${code}:${membership.playerId}`}
+            code={code}
+            membership={membership}
+            onInvalid={handleInvalid}
+            onLeft={handleLeft}
+            onAuthenticated={handleAuthenticated}
+            watchIntent={mode === 'spectate'}
+            onFallbackToWatch={() => setFallbackToSpectate(true)}
+          />
+        ) : mode === 'spectate' || fallbackToSpectate ? (
+          <SpectatorRoom code={code} onJoinedMember={handleSpectatorJoined} />
         ) : (
           <RoomLanding code={code} notice={notice} onJoined={setMembership} />
         )}

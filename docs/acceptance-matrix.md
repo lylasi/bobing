@@ -88,3 +88,9 @@
 | A19 不兼得／不追缴、A20 旧 maxRounds 迁移 | `tests/game.test.ts`「奖池与发奖」、`tests/server.test.ts`、`tests/db.test.ts` |
 
 本轮实际命令、审查修复与最终截图见 [可配置玩法集成验收](configurable-play-verification.md)，每项以真实执行结果为准。旧版本的实测记录保留在 `docs/verification.md` 与 `docs/primary-final-verification.md`。
+
+## 局内体验、大厅与旁观验收（2026-09-27）
+
+本轮 E01–E11、L01–L07 的标准见[确认设计稿](superpowers/specs/2026-09-27-bobing-experience-and-lobby.md)，默认值与旧房迁移以[实现契约](superpowers/specs/2026-09-27-bobing-implementation-contract.md)为准。
+
+[本轮实测记录](verification-2026-09-27.md)集中记录需求到测试的对应关系、完整套件结果、独立 HTTP/Socket 与三浏览器验收、375px 首屏实际几何和最终截图。记录同时保留修复前失败与复测结果，不以交付说明中的静态估算替代浏览器实测。旧房默认仅邀请且不允许旁观；旧状元经历不完整时明确提示；共用手机多人模式不在本轮实现范围。

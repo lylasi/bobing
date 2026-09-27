@@ -17,11 +17,13 @@ import { CORRUPTED_ROOM_MESSAGE, normalizeStoredRoom } from '../server/room-migr
 import type { InternalRoom } from '../server/game.js';
 import {
   applyRoll,
+  completeResultPresentation,
   createInternalRoom,
   finishGame,
   skipExpiredTurn,
   startGame,
 } from '../server/game.js';
+import { DEFAULT_RESULT_HOLD_SECONDS } from '../shared/presentation.js';
 import { createDefaultRoomConfig, poolFromConfig } from '../shared/room-config.js';
 import { emptyAwards } from '../shared/rules.js';
 import type { Membership } from '../shared/types.js';
@@ -78,15 +80,26 @@ function playedRoom(): InternalRoom {
       best: null,
       rollCount: 0,
       timeoutCount: 0,
+      lastRoll: null,
       tokenHash: `hash-${i}`,
       lastSeenAt: T0,
     });
   }
   startGame(room, T0, 0);
-  applyRoll(room, 'p0', DUITANG, T0);
-  skipExpiredTurn(room, T0 + 30_000);
-  finishGame(room, 'host-ended', T0 + 31_000);
+  applyRoll(room, 'p0', WUHONG, T0); // 状元 + 登顶事件
+  completePresentation(room);
+  applyRoll(room, 'p1', DUITANG, T0 + 1_000);
+  completePresentation(room);
+  skipExpiredTurn(room, room.deadline ?? 0); // 超时记录
+  completePresentation(room);
+  finishGame(room, 'host-ended', T0 + 31_000); // 结算并追加 settled 事件
   return room;
+}
+
+/** 读完当前结果展示（这些用例只关心存档往返，不关心展示时长）。 */
+function completePresentation(room: InternalRoom): void {
+  const until = room.presentation?.until ?? 0;
+  expect(completeResultPresentation(room, until)).toBe(true);
 }
 
 /** 旧版本（固定轮数时代）的房间快照：没有 config/ruleset/initialPool，带 pendingFinish。 */
@@ -442,6 +455,15 @@ describe('旧快照归一化', () => {
       original.players.map((player) => [player.rollCount, player.timeoutCount]),
     );
     expect(roundTripped.history).toEqual(original.history);
+    // 新字段必须逐项往返：节奏、访问设置、登顶事实与个人最后结果
+    expect(roundTripped.pacing).toEqual(original.pacing);
+    expect(roundTripped.access).toEqual(original.access);
+    expect(roundTripped.championEvents).toEqual(original.championEvents);
+    expect(roundTripped.championEvents.map((event) => event.kind)).toEqual(['first', 'settled']);
+    expect(roundTripped.championHistoryComplete).toBe(true);
+    expect(roundTripped.presentation).toEqual(original.presentation);
+    expect(roundTripped.players.map((player) => player.lastRoll)).toEqual(original.players.map((player) => player.lastRoll));
+    expect(roundTripped.players.find((player) => player.id === 'p0')!.lastRoll?.championOutcome?.kind).toBe('first');
 
     // 历史规则快照被原样保留：即使与当前注册表不同也不改判
     const stale = JSON.parse(JSON.stringify(original)) as Record<string, unknown>;
@@ -465,6 +487,13 @@ describe('旧快照归一化', () => {
       ['状元锁定字段缺失', () => ({ ...snapshot, champion: { playerId: 'p0', result: null, dice: [], at: T0 } })],
       ['规则快照与配置不一致', () => ({ ...snapshot, ruleset: { ...(snapshot.ruleset as object), id: 'high-tier-lock' } })],
       ['状态不是已知值', () => ({ ...snapshot, status: 'paused' })],
+      ['结果停留越界', () => ({ ...snapshot, pacing: { resultHoldSeconds: 11 } })],
+      ['结果停留是小数', () => ({ ...snapshot, pacing: { resultHoldSeconds: 0.5 } })],
+      ['访问可见性不是已知值', () => ({ ...snapshot, access: { visibility: 'secret', allowSpectators: true } })],
+      ['旁观开关不是布尔值', () => ({ ...snapshot, access: { visibility: 'public', allowSpectators: 'yes' } })],
+      ['展示阶段记录缺失', () => ({ ...snapshot, presentation: { until: T0 } })],
+      ['登顶事件类型未知', () => ({ ...snapshot, championEvents: [{ id: 'e1', recordId: null, kind: 'once-more', playerId: 'p0', nickname: '玩家0', previousPlayerId: null, previousNickname: null, round: 1, at: T0, dice: WUHONG, awardedCount: 0, locked: false }] })],
+      ['登顶事实类型未知', () => ({ ...snapshot, history: [(snapshot.history as Array<Record<string, unknown>>).map((record, index) => index === 0 ? { ...record, championOutcome: { kind: 'nope', previousPlayerId: null, currentPlayerId: null, locked: false } } : record)] })],
       ['既不是旧格式也不是新格式', () => ({ code: 'ABCDEF', players: [] })],
     ];
     for (const [label, build] of cases) {
@@ -472,6 +501,78 @@ describe('旧快照归一化', () => {
     }
     // 非法轮数不属于旧格式
     expect(() => normalizeStoredRoom({ ...legacyRoomSnapshot(), maxRounds: 7 })).toThrow(CORRUPTED_ROOM_MESSAGE);
+  });
+
+  it('旧房间不伪造登顶事实：事件为空、完整性标记为假，最后结果标成 legacy-unknown', () => {
+    const legacy = legacyRoomSnapshot();
+    const history = legacy.history as Array<Record<string, unknown>>;
+    history.push({
+      id: 'r5',
+      playerId: 'p0',
+      nickname: '玩家0',
+      round: 4,
+      turnId: 'e',
+      dice: WUHONG,
+      result: { code: 'wuhong', label: '五红', prize: 'zhuangyuan', rankKey: [8, 6, 0] },
+      awarded: null,
+      reason: 'rolled',
+      at: T0 + 4,
+    });
+    const room = normalizeStoredRoom(legacy);
+    // 旧数据无法区分“投出状元牌型”和“真的登顶过”，因此不补事件、标记不完整
+    expect(room.championEvents).toEqual([]);
+    expect(room.championHistoryComplete).toBe(false);
+    expect(room.champion).toBeNull();
+    expect(room.players.find((player) => player.id === 'p0')!.best).not.toBeNull(); // 个人最佳不等于登顶证据
+    // 个人最后结果从幸存历史回退，并标成 legacy-unknown
+    const lastRoll = room.players.find((player) => player.id === 'p0')!.lastRoll;
+    expect(lastRoll?.id).toBe('r5');
+    expect(lastRoll?.championOutcome?.kind).toBe('legacy-unknown');
+    expect(room.history.at(-1)?.championOutcome?.kind).toBe('legacy-unknown');
+    // 普通奖记录不会被错误标成曾登顶
+    expect(room.history.find((record) => record.id === 'r1')?.championOutcome).toBeNull();
+  });
+
+  it('旧房间迁移后仅邀请且关闭旁观，节奏取默认 1 秒，不自动放开可见性', () => {
+    const room = normalizeStoredRoom(legacyRoomSnapshot());
+    expect(room.pacing).toEqual({ resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS });
+    expect(room.access).toEqual({ visibility: 'invite', allowSpectators: false });
+    expect(room.presentation).toBeNull();
+    expect(room.presentationRemainingMs).toBeNull();
+    // 缺失新字段属于旧数据；只要出现但损坏就按损坏处理（见“新格式损坏时报错”）
+    expect(() => normalizeStoredRoom({ ...legacyRoomSnapshot(), access: { visibility: 'public' } })).toThrow(CORRUPTED_ROOM_MESSAGE);
+  });
+
+  it('上一版房间（有 config 但缺本轮新字段）迁移为仅邀请、默认 1 秒，并恢复个人最后结果', () => {
+    // 这是升级路径上最常见的一种：房间由上一版（有 config、有 240 条历史）写入，
+    // 但没有本轮的 pacing／access／presentation／championEvents／lastRoll／championOutcome。
+    const snapshot = JSON.parse(JSON.stringify(playedRoom())) as Record<string, unknown>;
+    for (const key of ['pacing', 'access', 'presentation', 'presentationRemainingMs', 'championEvents', 'championHistoryComplete']) {
+      delete snapshot[key];
+    }
+    for (const player of snapshot.players as Array<Record<string, unknown>>) delete player.lastRoll;
+    for (const record of snapshot.history as Array<Record<string, unknown>>) delete record.championOutcome;
+
+    const room = normalizeStoredRoom(snapshot);
+    // 节奏取默认 1 秒；旧数据的可见性不因为新房默认公开而放开
+    expect(room.pacing).toEqual({ resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS });
+    expect(room.access).toEqual({ visibility: 'invite', allowSpectators: false });
+    expect(room.presentation).toBeNull();
+    expect(room.presentationRemainingMs).toBeNull();
+    // 不伪造历程：事件为空、完整性为假；已经保存的状元归属事实原样保留
+    expect(room.championEvents).toEqual([]);
+    expect(room.championHistoryComplete).toBe(false);
+    expect(room.champion?.playerId).toBe('p0');
+    // 个人最后结果按玩家从幸存历史恢复：状元牌型标成 legacy-unknown，其余保持 null
+    expect(room.players.map((player) => player.lastRoll?.reason)).toEqual(['rolled', 'rolled', 'timeout']);
+    expect(room.players.find((player) => player.id === 'p0')?.lastRoll?.championOutcome?.kind).toBe('legacy-unknown');
+    expect(room.players.find((player) => player.id === 'p1')?.lastRoll?.result?.code).toBe('duitang');
+    expect(room.players.find((player) => player.id === 'p1')?.lastRoll?.championOutcome).toBeNull();
+    // 公开快照与归档共用同一份事实：迁移后仍然不完整，事件为空
+    const publicSnapshot = toPublicRoom(room);
+    expect(publicSnapshot.championHistoryComplete).toBe(false);
+    expect(publicSnapshot.championEvents).toEqual([]);
+    expect(publicSnapshot.players.find((player) => player.id === 'p0')?.lastRoll?.id).toBe(room.players[0]?.lastRoll?.id);
   });
 
   it('旧快照里未知房规字段一律忽略，只按 maxRounds 推导', () => {

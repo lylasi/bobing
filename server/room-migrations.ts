@@ -10,6 +10,15 @@
  * 迁移只做结构补齐，不改写历史选择：旧房间的 maxRounds、剩余库存、已发奖品、
  * 累计记录都尽量保留；旧玩家累计次数按仍保留的旧局记录重建（窗口内可见部分）。
  *
+ * 本轮新增字段的迁移口径：
+ *  - `pacing` 缺失时为默认 1 秒（与新房一致）；
+ *  - `access` 缺失时为“仅邀请、关闭旁观”，旧数据的可见性不自动放开；
+ *  - `presentation` 缺失时为 null（旧局没有展示阶段，回合即刻推进）；
+ *  - `championEvents` 缺失时为空且 `championHistoryComplete=false`，不伪造登顶事件；
+ *  - 玩家 `lastRoll` 缺失时从仍保留的记录里恢复本人最后一条，取不到为 null；
+ *  - 旧投掷记录没有 `championOutcome`：状元牌型标为 `legacy-unknown`，其余为 null。
+ * 上述字段一旦存在但结构损坏，仍按损坏报错，不静默当旧数据。
+ *
  * 旧归档表 completed_games 里还有第三种格式：当前代码“再开一局”写入的白名单公共快照，
  * 它天然没有内部字段，不能送进 InternalRoom 读取器。这类行由 readPublicArchiveSnapshot
  * 按公共白名单识别，readArchiveIdentity 先按 (房码, 建房时间, 局号) 查重后原样使用。
@@ -17,14 +26,21 @@
 
 import { DEFAULT_ROOM_NAME, PRIZE_KEYS, RULES_RESULT_ROWS, ROUND_OPTIONS, TURN_DURATION_MS } from '../shared/rules.js';
 import { createDefaultRoomConfig, normalizeRoomConfig, poolFromConfig } from '../shared/room-config.js';
+import { createLegacyRoomAccess, normalizeRoomAccess } from '../shared/room-access.js';
+import { createDefaultRoomPacing, normalizeRoomPacing } from '../shared/presentation.js';
 import { isRulesetId, snapshotRuleset } from '../shared/rulesets.js';
 import type {
   Champion,
+  ChampionEvent,
+  ChampionOutcome,
   DiceResult,
   FinishedReason,
   PrizeKey,
   ResultCode,
+  ResultPresentation,
+  RoomAccess,
   RoomConfig,
+  RoomPacing,
   RoomStatus,
   RollRecord,
   RulesetSnapshot,
@@ -48,6 +64,16 @@ const FINISHED_REASONS: readonly FinishedReason[] = [
 ];
 const INCOMPLETE_REASONS: readonly FinishedReason[] = ['host-ended', 'players-left', 'all-left', 'offline-expired'];
 const ROLL_REASONS: readonly RollRecord['reason'][] = ['rolled', 'timeout'];
+const CHAMPION_OUTCOME_KINDS: readonly ChampionOutcome['kind'][] = [
+  'first',
+  'takeover',
+  'improved',
+  'tied',
+  'lower',
+  'locked',
+  'legacy-unknown',
+];
+const CHAMPION_EVENT_KINDS: readonly ChampionEvent['kind'][] = ['first', 'takeover', 'improved', 'settled'];
 const RESULT_CODES: ReadonlySet<string> = new Set(RULES_RESULT_ROWS.map((row) => row.code));
 const PRIZE_KEY_SET: ReadonlySet<string> = new Set(PRIZE_KEYS);
 
@@ -142,19 +168,121 @@ function readCurrentRoom(raw: Record<string, unknown>): InternalRoom {
   const config = readConfig(raw.config);
   const ruleset = readRuleset(raw.ruleset, config);
   const initialPool = poolFromConfig(config);
+  const core = readCore(raw, true);
   return {
-    ...readCore(raw, true),
+    ...core,
     config,
     ruleset,
     initialPool,
+    // 新增房间设置：旧快照缺字段时按迁移默认补齐，出现但损坏时报错（不静默当旧数据）
+    pacing: readPacingField(raw.pacing),
+    access: readAccessField(raw.access),
     pool: requirePool(raw.pool, 'pool'),
     champion: readChampion(raw.champion, true),
+    championEvents: readChampionEventsField(raw.championEvents),
+    championHistoryComplete: readChampionHistoryCompleteField(raw),
+    presentation: readPresentationField(raw.presentation),
+    presentationRemainingMs: readOptionalTimestamp(raw.presentationRemainingMs, 'presentationRemainingMs'),
     // 当前格式里 closingRound 必须存在（可以为 null）：缺失说明快照被截断，不能当成“没有收尾轮”
     closingRound: readClosingRound(requiredField(raw, 'closingRound')),
     incomplete: readBoolean(requiredField(raw, 'incomplete'), 'incomplete'),
     allOfflineSince: readTimestampOrNull(requiredField(raw, 'allOfflineSince'), 'allOfflineSince'),
     expiresAt: readTimestampOrNull(requiredField(raw, 'expiresAt'), 'expiresAt'),
-    players: readPlayers(raw.players, true),
+    players: readPlayers(raw.players, true, core.history),
+  };
+}
+
+/** 旧快照缺字段时的宽限读取：只有字段确实存在时才严格校验。 */
+function readOptionalTimestamp(value: unknown, label: string): number | null {
+  if (value === undefined) return null;
+  return readTimestampOrNull(value, label);
+}
+
+/** 节奏：缺失（旧快照）用默认 1 秒；显式给出但非法即报损坏。 */
+function readPacingField(value: unknown): RoomPacing {
+  try {
+    return normalizeRoomPacing(value);
+  } catch (error) {
+    corrupted(`节奏配置不合法（${error instanceof Error ? error.message : String(error)}）`);
+  }
+}
+
+/** 访问设置：旧快照缺失时迁移为“仅邀请、关闭旁观”，不自动放开。 */
+function readAccessField(value: unknown): RoomAccess {
+  if (value === undefined) return createLegacyRoomAccess();
+  try {
+    return normalizeRoomAccess(value);
+  } catch (error) {
+    corrupted(`访问设置不合法（${error instanceof Error ? error.message : String(error)}）`);
+  }
+}
+
+/**
+ * 结果展示阶段：旧快照没有该字段时为 null。
+ * 暂停中的展示 `until` 为 null，剩余时间保存在内部字段里。
+ */
+function readPresentationField(value: unknown): ResultPresentation | null {
+  if (value === null || value === undefined) return null;
+  const raw = asObject(value, 'presentation');
+  const recordId = raw.recordId;
+  if (typeof recordId !== 'string' || recordId.length === 0) corrupted('presentation.recordId 必须是非空字符串');
+  return { recordId, until: readTimestampOrNull(raw.until, 'presentation.until') };
+}
+
+/**
+ * 状元历程：旧快照没有该字段时为空且完整性 false（不伪造历史事件）。
+ * 字段存在时逐条严格校验，损坏即报错。
+ */
+function readChampionEventsField(value: unknown): ChampionEvent[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) corrupted('championEvents 必须是数组');
+  return value.map((entry, index) => readChampionEvent(entry, index));
+}
+
+function readChampionHistoryCompleteField(raw: Record<string, unknown>): boolean {
+  // 没有事件数组的旧快照一定不完整；有事件数组但缺完整性标记时按新局处理
+  if (raw.championEvents === undefined) return false;
+  if (raw.championHistoryComplete === undefined) return true;
+  return readBoolean(raw.championHistoryComplete, 'championHistoryComplete');
+}
+
+function readChampionEvent(value: unknown, index: number): ChampionEvent {
+  const label = `championEvents[${index}]`;
+  const raw = asObject(value, label);
+  const kind = raw.kind;
+  if (typeof kind !== 'string' || !(CHAMPION_EVENT_KINDS as readonly string[]).includes(kind)) {
+    corrupted(`${label}.kind 不是已知状元事件类型`);
+  }
+  const recordId = raw.recordId;
+  if (recordId !== null && (typeof recordId !== 'string' || recordId.length === 0)) {
+    corrupted(`${label}.recordId 必须是非空字符串或 null`);
+  }
+  const previousPlayerId = raw.previousPlayerId;
+  const previousNickname = raw.previousNickname;
+  if (previousPlayerId !== null && typeof previousPlayerId !== 'string') corrupted(`${label}.previousPlayerId 必须是字符串或 null`);
+  if (previousNickname !== null && typeof previousNickname !== 'string') corrupted(`${label}.previousNickname 必须是字符串或 null`);
+  const dice = raw.dice;
+  if (!Array.isArray(dice) || !dice.every((die) => typeof die === 'number')) {
+    corrupted(`${label}.dice 必须是数字数组`);
+  }
+  const result = readResult(raw.result, `${label}.result`, true);
+  if (result === null) corrupted(`${label}.result 缺失`);
+  const awardedCount = readInteger(raw.awardedCount, `${label}.awardedCount`, 0);
+  const previousPlayer = previousPlayerId ?? null;
+  return {
+    id: readString(raw.id, `${label}.id`),
+    recordId: (recordId as string | null) ?? null,
+    kind: kind as ChampionEvent['kind'],
+    playerId: readString(raw.playerId, `${label}.playerId`),
+    nickname: readString(raw.nickname, `${label}.nickname`),
+    previousPlayerId: previousPlayer,
+    previousNickname: (previousNickname as string | null) ?? null,
+    round: readInteger(raw.round, `${label}.round`, 0),
+    at: readTimestampOrNull(raw.at, `${label}.at`) ?? corrupted(`${label}.at 必须是有限数字`),
+    dice: [...(dice as number[])],
+    result,
+    locked: readBoolean(raw.locked, `${label}.locked`),
+    awardedCount,
   };
 }
 
@@ -230,11 +358,19 @@ function readLegacyRoom(raw: Record<string, unknown>): InternalRoom {
   return {
     ...core,
     config,
+    // 旧房间：节奏回退默认 1 秒，访问设置迁移为“仅邀请、关闭旁观”，不伪造状元历程。
+    // 字段缺失属于旧数据；一旦出现就必须合法，出现但损坏同样按损坏处理，不静默当旧数据。
+    pacing: 'pacing' in raw ? readPacingField(raw.pacing) : createDefaultRoomPacing(),
+    access: 'access' in raw ? readAccessField(raw.access) : createLegacyRoomAccess(),
     ruleset: snapshotRuleset('continuous'),
     initialPool: poolFromConfig(config),
     // 旧房间的剩余库存照常保留；缺失时退回原默认满额
     pool: readPool(raw.pool, 'pool', false) ?? poolFromConfig(config),
     champion,
+    championEvents: 'championEvents' in raw ? readChampionEventsField(raw.championEvents) : [],
+    championHistoryComplete: false,
+    presentation: 'presentation' in raw ? readPresentationField(raw.presentation) : null,
+    presentationRemainingMs: null,
     closingRound,
     incomplete,
     allOfflineSince: null,
@@ -462,6 +598,41 @@ function readHistory(value: unknown, strict: boolean): RollRecord[] {
   return records;
 }
 
+/**
+ * 旧记录没有 `championOutcome`（当时还没有保存归属判断）：状元牌型标为 legacy-unknown，
+ * 其余保持 null。绝不用当前的状元归属重新解释旧记录。
+ */
+function readRollRecordChampionOutcome(value: unknown, result: DiceResult | null, label: string, strict: boolean): ChampionOutcome | null {
+  if (value === undefined) {
+    return result !== null && result.prize === 'zhuangyuan'
+      ? { kind: 'legacy-unknown', previousPlayerId: null, currentPlayerId: null, locked: false }
+      : null;
+  }
+  if (value === null) return null;
+  if (!isObject(value)) {
+    if (strict) corrupted(`${label}.championOutcome 必须是对象或 null`);
+    return null;
+  }
+  const kind = value.kind;
+  if (typeof kind !== 'string' || !(CHAMPION_OUTCOME_KINDS as readonly string[]).includes(kind)) {
+    corrupted(`${label}.championOutcome.kind 不是已知判定类型`);
+  }
+  const previousPlayerId = value.previousPlayerId;
+  const currentPlayerId = value.currentPlayerId;
+  if (previousPlayerId !== null && typeof previousPlayerId !== 'string') {
+    corrupted(`${label}.championOutcome.previousPlayerId 必须是字符串或 null`);
+  }
+  if (currentPlayerId !== null && typeof currentPlayerId !== 'string') {
+    corrupted(`${label}.championOutcome.currentPlayerId 必须是字符串或 null`);
+  }
+  return {
+    kind: kind as ChampionOutcome['kind'],
+    previousPlayerId: (previousPlayerId as string | null) ?? null,
+    currentPlayerId: (currentPlayerId as string | null) ?? null,
+    locked: readBoolean(value.locked, `${label}.championOutcome.locked`),
+  };
+}
+
 function readRollRecord(value: unknown, index: number, strict: boolean): RollRecord | null {
   const label = `history[${index}]`;
   if (!isObject(value)) {
@@ -487,6 +658,7 @@ function readRollRecord(value: unknown, index: number, strict: boolean): RollRec
     if (strict) corrupted(`${label} 结构不合法`);
     return null;
   }
+  const result = readResult(value.result, `${label}.result`, strict);
   return {
     id: value.id,
     playerId: value.playerId,
@@ -494,10 +666,11 @@ function readRollRecord(value: unknown, index: number, strict: boolean): RollRec
     round: value.round,
     turnId: value.turnId,
     dice: [...(dice as number[])],
-    result: readResult(value.result, `${label}.result`, strict),
+    result,
     awarded: awarded as PrizeKey | null,
     reason: reason as RollRecord['reason'],
     at: value.at,
+    championOutcome: readRollRecordChampionOutcome(value.championOutcome, result, label, strict),
   };
 }
 
@@ -512,6 +685,8 @@ const PUBLIC_ROOM_KEYS: ReadonlySet<string> = new Set([
   'name',
   'maxPlayers',
   'config',
+  'pacing',
+  'access',
   'ruleset',
   'rulesVersion',
   'status',
@@ -527,6 +702,9 @@ const PUBLIC_ROOM_KEYS: ReadonlySet<string> = new Set([
   'pool',
   'initialPool',
   'champion',
+  'championEvents',
+  'championHistoryComplete',
+  'presentation',
   'closingRound',
   'incomplete',
   'allOfflineSince',
@@ -548,6 +726,7 @@ const PUBLIC_PLAYER_KEYS: ReadonlySet<string> = new Set([
   'best',
   'rollCount',
   'timeoutCount',
+  'lastRoll',
 ]);
 
 /** 公共快照里可用于归档的身份与结束信息。 */
@@ -616,12 +795,20 @@ export function readArchiveIdentity(value: unknown): { code: string; createdAt: 
 
 /**
  * 读取成员。旧格式玩家没有 rollCount／timeoutCount，按仍然保留的旧局记录重建
- * （历史窗口最多 240 条，这是旧数据能提供的最完整信息）。
+ * （历史窗口最多 240 条，这是旧数据能提供的最完整信息）；
+ * `lastRoll` 同理：旧快照没有该字段时，从仍然保留的记录里取本人的最后一条，取不到为 null。
  */
 function readPlayers(value: unknown, strict: boolean, history: RollRecord[] = []): InternalPlayer[] {
   if (!Array.isArray(value) || value.length === 0) corrupted('players 必须是非空数组');
   const rebuilt = strict ? null : countRollsFromHistory(history);
-  return (value as unknown[]).map((entry, index) => readPlayer(entry, index, strict, rebuilt));
+  const lastRolls = lastRollByPlayer(history);
+  return (value as unknown[]).map((entry, index) => readPlayer(entry, index, strict, rebuilt, lastRolls));
+}
+
+function lastRollByPlayer(history: readonly RollRecord[]): Map<string, RollRecord> {
+  const last = new Map<string, RollRecord>();
+  for (const record of history) last.set(record.playerId, record);
+  return last;
 }
 
 function countRollsFromHistory(history: readonly RollRecord[]): Map<string, { rollCount: number; timeoutCount: number }> {
@@ -640,6 +827,7 @@ function readPlayer(
   index: number,
   strict: boolean,
   rebuilt: Map<string, { rollCount: number; timeoutCount: number }> | null,
+  lastRolls: Map<string, RollRecord>,
 ): InternalPlayer {
   const label = `players[${index}]`;
   const raw = asObject(value, label);
@@ -669,7 +857,16 @@ function readPlayer(
     best: readResult(bestValue, `${label}.best`, strict),
     rollCount,
     timeoutCount,
+    // 旧快照没有 lastRoll：能从仍保留的记录恢复就恢复，否则为 null（绝不用当前状元重新推断）
+    lastRoll: readPlayerLastRollField(raw.lastRoll, lastRolls.get(id) ?? null, label),
     tokenHash: readString(pick('tokenHash', undefined), `${label}.tokenHash`),
     lastSeenAt: lastSeenAt ?? 0,
   };
+}
+
+/** 个人最后结果：字段缺失时用记录里的最后一条兜底；显式 null 就是 null。 */
+function readPlayerLastRollField(value: unknown, fallback: RollRecord | null, label: string): RollRecord | null {
+  if (value === undefined) return fallback ? { ...fallback, dice: [...fallback.dice], championOutcome: fallback.championOutcome ? { ...fallback.championOutcome } : null } : null;
+  if (value === null) return null;
+  return readRollRecord(value, 0, true) ?? corrupted(`${label}.lastRoll 不合法`);
 }

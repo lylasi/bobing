@@ -6,13 +6,19 @@ import { io as connectClient } from 'socket.io-client';
 import type { Socket } from 'socket.io-client';
 import { createServerInstance } from '../server/index.js';
 import type { ServerInstance } from '../server/index.js';
-import { RoomService } from '../server/room-service.js';
+import { RoomService, hashToken } from '../server/room-service.js';
 import type { RateLimitOptions } from '../server/room-service.js';
 import { AppDatabase } from '../server/db.js';
 import { createDefaultRoomConfig } from '../shared/room-config.js';
 import { PRIZE_KEYS } from '../shared/rules.js';
-import { SOCKET_EVENT_ROOM_STATE } from '../shared/types.js';
-import type { Membership, RoomConfig, RoomState } from '../shared/types.js';
+import { DEFAULT_RESULT_HOLD_SECONDS, DICE_REVEAL_MS } from '../shared/presentation.js';
+import { createDefaultRoomAccess } from '../shared/room-access.js';
+import {
+  SOCKET_EVENT_AUDIENCE,
+  SOCKET_EVENT_ROOM_STATE,
+  SOCKET_EVENT_WATCH_ENDED,
+} from '../shared/types.js';
+import type { AudienceState, LobbyRoomSummary, Membership, RoomConfig, RoomState, WatchEnded } from '../shared/types.js';
 
 const NONE = [1, 1, 2, 2, 3, 3];
 const YIXIU = [4, 1, 2, 3, 5, 5];
@@ -230,7 +236,15 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 4000
 
 async function createRoom(
   env: TestEnv,
-  overrides: { nickname?: string; name?: string; maxPlayers?: number; maxRounds?: number; config?: RoomConfig } = {},
+  overrides: {
+    nickname?: string;
+    name?: string;
+    maxPlayers?: number;
+    maxRounds?: number;
+    config?: RoomConfig;
+    pacing?: unknown;
+    access?: unknown;
+  } = {},
 ): Promise<{ notification?: never; code: string; membership: Membership; room: RoomState }> {
   const body: Record<string, unknown> = {
     nickname: overrides.nickname ?? '阿月',
@@ -240,6 +254,8 @@ async function createRoom(
   // 新客户端发送 config；未指定时沿用旧 maxRounds 请求（服务端显式映射为固定轮数）
   if (overrides.config !== undefined) body.config = overrides.config;
   else body.maxRounds = overrides.maxRounds ?? 5;
+  if (overrides.pacing !== undefined) body.pacing = overrides.pacing;
+  if (overrides.access !== undefined) body.access = overrides.access;
   const result = await env.api('POST', '/api/rooms', { body });
   expect(result.status).toBe(201);
   return { code: result.body.room.code, membership: result.body.membership, room: result.body.room };
@@ -335,6 +351,60 @@ async function rollOnce(env: TestEnv, code: string, token: string, expectedTurnI
   });
 }
 
+/**
+ * 读完当前结果展示：把时钟推到展示结束时刻再走真实服务端 tick，
+ * 而不是绕过展示阶段直接推进回合。展示结束会结算最后一掷或轮到下一位。
+ */
+async function readThroughPresentation(env: TestEnv, code: string, token: string): Promise<RoomState> {
+  const room = await env.roomState(code, token);
+  if (!room.presentation) return room;
+  const until = room.presentation.until;
+  expect(until, '未暂停的房间必须给出展示结束时刻').not.toBeNull();
+  env.clock.now = until as number;
+  env.instance.service.tick(env.clock.now);
+  return env.roomState(code, token);
+}
+
+/** 掷骰并读完结果展示，返回展示结束后的权威快照。 */
+async function rollThrough(env: TestEnv, code: string, token: string, expectedTurnId: string): Promise<RoomState> {
+  const rolled = await rollOnce(env, code, token, expectedTurnId);
+  expect(rolled.status).toBe(200);
+  return readThroughPresentation(env, code, token);
+}
+
+/** 观众连接（不需要成员凭证）：viewerId 只是浏览器自己生成的去重标识。 */
+async function connectSpectator(
+  env: TestEnv,
+  roomCode: string,
+  viewerId = crypto.randomUUID(),
+): Promise<{ socket: Socket; log: StateLog; audience: AudienceState[]; ended: WatchEnded[]; viewerId: string }> {
+  const audience: AudienceState[] = [];
+  const ended: WatchEnded[] = [];
+  const socket = connectClient(env.base, {
+    auth: { role: 'spectator', roomCode, viewerId },
+    transports: ['websocket'],
+    reconnection: false,
+    forceNew: true,
+    timeout: 4000,
+  });
+  trackSocket(env, socket);
+  const log = createStateLog(socket);
+  socket.on(SOCKET_EVENT_AUDIENCE, (payload: AudienceState) => audience.push(payload));
+  socket.on(SOCKET_EVENT_WATCH_ENDED, (payload: WatchEnded) => ended.push(payload));
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('观众连接超时')), 5000);
+    socket.once('connect', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    socket.once('connect_error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  return { socket, log, audience, ended, viewerId };
+}
+
 function assertNoSecrets(value: unknown, token: string): void {
   if (typeof value === 'string') {
     expect(value).not.toContain(token);
@@ -361,10 +431,11 @@ describe('健康检查与创建房间', () => {
     expect(result.body).toEqual({ ok: true });
   });
 
-  it('创建返回 201、房主默认准备、6 位房码不含易混淆字符', async () => {
+  it('创建返回 201、房主默认准备、6 位纯数字房码且新房默认公开并停留 1 秒', async () => {
     const env = await startServer();
     const created = await createRoom(env, { nickname: '阿月' });
-    expect(created.code).toMatch(/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/);
+    // 新房码是六位纯数字字符串，前导零必须保留（不能用 number 存储或展示）
+    expect(created.code).toMatch(/^[0-9]{6}$/);
     expect(created.membership.token).toHaveLength(64); // 32 字节 token 的十六进制
     expect(created.membership.roomCode).toBe(created.code);
     expect(created.room.status).toBe('waiting');
@@ -374,6 +445,42 @@ describe('健康检查与创建房间', () => {
     expect(created.room.pool).toEqual({ zhuangyuan: 1, duitang: 2, sanhong: 4, sijin: 8, erju: 16, yixiu: 32 });
     expect(created.room.rulesVersion).toBe('unified-v1');
     expect(created.room.expiresAt! - created.room.createdAt).toBe(24 * 3600 * 1000);
+    // 省略 pacing／access 时必须落到新房默认，而不是因为“缺字段”被拒绝
+    expect(created.room.pacing).toEqual({ resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS });
+    expect(created.room.access).toEqual(createDefaultRoomAccess());
+  });
+
+  it('房码生成保留前导零，并沿用 50 次防碰撞重试与墓碑检查', async () => {
+    // 生成器连续吐出同一个带前导零的码，第二次创建必须重试而不是覆盖已有房间
+    const codes = ['028416', '028416', '000001'];
+    const env = await startServer({ createRoomCode: () => codes.shift() ?? '999999' });
+    const first = await createRoom(env, { nickname: '阿月' });
+    expect(first.code).toBe('028416');
+    const second = await createRoom(env, { nickname: '阿桂' });
+    expect(second.code).toBe('000001');
+    expect(first.code).not.toBe(second.code);
+
+    const exhausted = await startServer({ createRoomCode: () => '028416' });
+    await createRoom(exhausted, { nickname: '阿月' });
+    const failed = await exhausted.api('POST', '/api/rooms', { body: { nickname: '阿桂', name: '中秋团圆局', maxPlayers: 2 } });
+    expect(failed.status).toBe(500);
+    expect(failed.body.error.code).toBe('INTERNAL_ERROR');
+  });
+
+  it('旧字符集房码仍可访问既有房间（L01 兼容）', async () => {
+    const env = await startServer({ createRoomCode: () => 'ABC234' });
+    const created = await createRoom(env, { nickname: '阿月' });
+    expect(created.code).toBe('ABC234');
+    // 旧码用文本输入，忽略空白并转大写
+    const preview = await env.api('GET', `/api/rooms/%20${created.code.toLowerCase()}%20`);
+    expect(preview.status).toBe(200);
+    expect(preview.body.code).toBe(created.code);
+    // 非法房码（长度不对或字符不在新旧字符集内）仍然拒绝
+    for (const bad of ['12345', '1234567', 'ABCDE0', 'ABCDEI', 'AAAAA1']) {
+      const result = await env.api('GET', `/api/rooms/${encodeURIComponent(bad)}`);
+      expect(result.status, bad).toBe(400);
+      expect(result.body.error.code).toBe('INVALID_INPUT');
+    }
   });
 
   it('概况接口只暴露概况与配置，不含成员信息和凭证', async () => {
@@ -389,6 +496,9 @@ describe('健康检查与创建房间', () => {
       playerCount: 1,
       maxPlayers: 2,
       config,
+      // 节奏与访问设置与 config 分开，但都属于公开概况（持有房码者可见）
+      pacing: { resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS },
+      access: createDefaultRoomAccess(),
       ruleset: created.room.ruleset,
       status: 'waiting',
       rulesVersion: 'unified-v1',
@@ -591,7 +701,7 @@ describe('幂等与并发掷骰', () => {
     expect(room.pool.duitang).toBe(1);
   });
 
-  it('同回合不同 requestId 并发时只有一个成功，另一个 STALE_TURN', async () => {
+  it('同回合不同 requestId 并发时只有一个成功，另一个 RESULT_SHOWING', async () => {
     const env = await startServer();
     const game = await startTwoPlayerGame(env);
     const turnId = game.room.turnId!;
@@ -604,10 +714,12 @@ describe('幂等与并发掷骰', () => {
     const statuses = results.map((result) => result.status).sort();
     expect(statuses).toEqual([200, 409]);
     const failed = results.find((result) => result.status === 409)!;
-    expect(failed.body.error.code).toBe('STALE_TURN');
+    // 第一次投掷已经进入结果展示阶段：第二次不同 requestId 的投掷必须被展示阶段挡下
+    expect(failed.body.error.code).toBe('RESULT_SHOWING');
 
     const room = await env.roomState(game.code, game.host.token);
     expect(room.history.filter((record) => record.turnId === turnId)).toHaveLength(1);
+    expect(room.players.find((player) => player.id === game.host.playerId)?.rollCount).toBe(1);
   });
 
   it('旧 turnId 配新 requestId 不能偷下一回合', async () => {
@@ -619,7 +731,12 @@ describe('幂等与并发掷骰', () => {
       token: game.host.token,
     });
     expect(firstRoll.status).toBe(200);
-    expect(firstRoll.body.room.turnPlayerId).toBe(game.guest.playerId);
+    // 展示期间仍保留本次上下文（turnId／turnPlayerId），下一位要等展示结束才接手
+    expect((firstRoll.body.room as RoomState).turnId).toBe(oldTurnId);
+    expect((firstRoll.body.room as RoomState).presentation).not.toBeNull();
+    await readThroughPresentation(env, game.code, game.host.token);
+    const handedOver = await env.roomState(game.code, game.host.token);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
 
     const replay = await env.api('POST', `/api/rooms/${game.code}/actions`, {
       body: { type: 'roll', requestId: crypto.randomUUID(), expectedTurnId: oldTurnId },
@@ -630,6 +747,7 @@ describe('幂等与并发掷骰', () => {
 
     const room = await env.roomState(game.code, game.host.token);
     expect(room.history).toHaveLength(1);
+    expect(room.turnPlayerId).toBe(game.guest.playerId);
   });
 
   it('重复请求返回已提交状态且不消耗下一次机会', async () => {
@@ -638,10 +756,18 @@ describe('幂等与并发掷骰', () => {
     const payload = { type: 'roll', requestId: crypto.randomUUID(), expectedTurnId: game.room.turnId! };
     const first = await env.api('POST', `/api/rooms/${game.code}/actions`, { body: payload, token: game.host.token });
     expect(first.status).toBe(200);
+    // 展示期间的重复 requestId 仍走幂等回执：不是 RESULT_SHOWING
     const replay = await env.api('POST', `/api/rooms/${game.code}/actions`, { body: payload, token: game.host.token });
     expect(replay.status).toBe(200);
     expect(replay.body.room.history).toHaveLength(first.body.room.history.length);
-    expect(replay.body.room.turnPlayerId).toBe(game.guest.playerId);
+    expect(replay.body.room.turnId).toBe(first.body.room.turnId);
+    expect(replay.body.room.presentation).toEqual(first.body.room.presentation);
+
+    // 展示读完后才轮到下一位，且这一手没有额外消耗第二次机会
+    const after = await readThroughPresentation(env, game.code, game.host.token);
+    expect(after.turnPlayerId).toBe(game.guest.playerId);
+    expect(after.history).toHaveLength(1);
+    expect(after.players.find((player) => player.id === game.host.playerId)?.rollCount).toBe(1);
   });
 });
 
@@ -756,6 +882,10 @@ describe('持久化与重启恢复', () => {
     expect(stillPaused.history).toHaveLength(1);
     expect(stillPaused.paused).toBe(true);
 
+    // 重启时展示阶段被暂停：保留剩余时长但不给绝对时刻
+    expect(restored.presentation?.recordId).toBe(before.presentation?.recordId);
+    expect(restored.presentation?.until).toBeNull();
+
     // 暂停期间不接受掷骰
     const whilePaused = await second.api('POST', `/api/rooms/${game.code}/actions`, {
       body: { type: 'roll', requestId: crypto.randomUUID(), expectedTurnId: restored.turnId },
@@ -764,10 +894,28 @@ describe('持久化与重启恢复', () => {
     expect(whilePaused.status).toBe(409);
     expect(whilePaused.body.error.code).toBe('INVALID_STATE');
 
-    // 成员重新连接恢复倒计时后仍能继续这一回合
+    // 成员重新连接：展示继续剩余时长，不重播动画、也不倒退轮次
     second.instance.service.connectMember(game.code, game.guest.token);
-    const afterRestart = await second.api('POST', `/api/rooms/${game.code}/actions`, {
+    const resumed = await second.roomState(game.code, game.host.token);
+    expect(resumed.paused).toBe(false);
+    expect(resumed.presentation?.recordId).toBe(before.presentation?.recordId);
+    expect(resumed.presentation?.until).toBeGreaterThan(clock.now);
+    expect(resumed.turnId).toBe(before.turnId); // 展示期间仍保留本次上下文
+    expect(resumed.turnPlayerId).toBe(before.turnPlayerId);
+
+    // 展示未结束前，下一位不能抢先掷骰
+    const tooEarly = await second.api('POST', `/api/rooms/${game.code}/actions`, {
       body: { type: 'roll', requestId: crypto.randomUUID(), expectedTurnId: restored.turnId },
+      token: game.guest.token,
+    });
+    expect(tooEarly.status).toBe(409);
+    expect(tooEarly.body.error.code).toBe('RESULT_SHOWING');
+
+    // 展示读完后轮到下一位，并能从实际开放时刻继续掷骰
+    const handedOver = await readThroughPresentation(second, game.code, game.host.token);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    const afterRestart = await second.api('POST', `/api/rooms/${game.code}/actions`, {
+      body: { type: 'roll', requestId: crypto.randomUUID(), expectedTurnId: handedOver.turnId },
       token: game.guest.token,
     });
     expect(afterRestart.status).toBe(200);
@@ -892,11 +1040,10 @@ describe('结算、离开与再开一局', () => {
       const current = state.turnPlayerId;
       const playerToken = current === game.host.playerId ? game.host.token : game.guest.token;
       token = playerToken;
-      const rolled = await env.api('POST', `/api/rooms/${game.code}/actions`, {
-        body: { type: 'roll', requestId: crypto.randomUUID(), expectedTurnId: state.turnId },
-        token: playerToken,
-      });
+      const rolled = await rollOnce(env, game.code, playerToken, state.turnId as string);
       expect(rolled.status, `第 ${i + 1} 手`).toBe(200);
+      // 每一手都要读完结果展示：最后一手也在此阶段结束后才结算
+      await readThroughPresentation(env, game.code, game.host.token);
     }
     const finished = await env.roomState(game.code, token);
     expect(finished.status).toBe('finished');
@@ -1068,12 +1215,25 @@ describe('超时与计时', () => {
     expect(room.history[0].reason).toBe('timeout');
     expect(room.history[0].dice).toEqual([]);
     expect(room.history[0].awarded).toBeNull();
-    expect(room.turnPlayerId).toBe(game.guest.playerId);
-    expect(room.round).toBe(1);
+    // 超时没有动画，先进入只含停留时长的结果展示：保留本次上下文、deadline 为空
+    expect(room.presentation?.recordId).toBe(room.history[0].id);
+    expect(room.presentation?.until).toBe(env.clock.now + TURN_MS + DEFAULT_RESULT_HOLD_SECONDS * 1000);
+    expect(room.deadline).toBeNull();
+    expect(room.turnPlayerId).toBe(game.host.playerId);
 
+    // 同一时刻重复 tick 不重复跳过，也不提前推进
     expect(env.instance.service.tick(env.clock.now + TURN_MS)).toEqual([]);
     const after = await env.roomState(game.code, game.host.token);
     expect(after.history).toHaveLength(1);
+    expect(after.turnPlayerId).toBe(game.host.playerId);
+
+    // 展示读完才轮到下一位，且下一位是同一轮里的第二位
+    const handedOver = await readThroughPresentation(env, game.code, game.host.token);
+    expect(handedOver.history).toHaveLength(1);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    expect(handedOver.round).toBe(1);
+    // 下一位拿到完整三十秒（从实际开放时刻起算）
+    expect(handedOver.deadline! - env.clock.now).toBe(TURN_MS);
   });
 
   it('到期与下一次 tick 之间迟到的掷骰：先按超时结算再返回 STALE_TURN', async () => {
@@ -1093,11 +1253,19 @@ describe('超时与计时', () => {
     expect(room.history[0].reason).toBe('timeout');
     expect(room.history[0].dice).toEqual([]);
     expect(room.history[0].awarded).toBeNull();
-    expect(room.turnPlayerId).toBe(game.guest.playerId);
+    // 迟到的掷骰不消耗机会：超时进入展示阶段，本次上下文仍是超时者
+    expect(room.presentation?.recordId).toBe(room.history[0].id);
+    expect(room.turnPlayerId).toBe(game.host.playerId);
     // 只推进一次：随后 tick 不再补跳
     expect(env.instance.service.tick(env.clock.now)).toEqual([]);
     const after = await env.roomState(game.code, game.host.token);
     expect(after.history).toHaveLength(1);
+
+    // 展示读完才轮到下一位，且不会补掷这一手
+    const handedOver = await readThroughPresentation(env, game.code, game.host.token);
+    expect(handedOver.history).toHaveLength(1);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    expect(handedOver.players.find((player) => player.id === game.host.playerId)?.rollCount).toBe(0);
   });
 
   it('掷骰与 tick 交错不会重复轮转', async () => {
@@ -1108,12 +1276,18 @@ describe('超时与计时', () => {
       token: game.host.token,
     });
     expect(rolled.status).toBe(200);
-    // deadline 已经推进到 +30 秒，用上一手的旧时间点 tick 不应再跳过
+    // 展示阶段内的 tick 既不跳过回合，也不提前交给下一位
     expect(env.instance.service.tick(env.clock.now)).toEqual([]);
     expect(env.instance.service.tick(env.clock.now + 1_000)).toEqual([]);
     const room = await env.roomState(game.code, game.host.token);
     expect(room.history).toHaveLength(1);
-    expect(room.turnPlayerId).toBe(game.guest.playerId);
+    expect(room.presentation).not.toBeNull();
+    expect(room.turnPlayerId).toBe(game.host.playerId);
+
+    const handedOver = await readThroughPresentation(env, game.code, game.host.token);
+    expect(handedOver.history).toHaveLength(1);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    expect(handedOver.round).toBe(1);
   });
 });
 
@@ -1492,7 +1666,8 @@ describe('房间配置：创建、校验与公开快照', () => {
       const token = state.turnPlayerId === game.host.playerId ? game.host.token : game.guest.token;
       const rolled = await rollOnce(env, game.code, token, state.turnId as string);
       expect(rolled.status).toBe(200);
-      state = rolled.body.room as RoomState;
+      // 每一手都读完结果展示再进入下一手，节奏不改变“无限轮数”的判定
+      state = await readThroughPresentation(env, game.code, game.host.token);
     }
     expect(state.status).toBe('playing');
     expect(state.round).toBeGreaterThan(20);
@@ -1641,9 +1816,14 @@ describe('离线计时与过期归档', () => {
     const first = await rollOnce(env, game.code, game.host.token, game.room.turnId as string);
     expect(first.status).toBe(200);
     expect((first.body.room as RoomState).pool.zhuangyuan).toBe(1);
-    const second = await rollOnce(env, game.code, game.guest.token, (first.body.room as RoomState).turnId as string);
+    // 结果展示读完才轮到客人，否则投掷会被展示阶段挡下
+    const afterFirst = await readThroughPresentation(env, game.code, game.host.token);
+    expect(afterFirst.turnPlayerId).toBe(game.guest.playerId);
+    const second = await rollOnce(env, game.code, game.guest.token, afterFirst.turnId as string);
     expect(second.status).toBe(200);
     expect((second.body.room as RoomState).players.find((player) => player.id === game.guest.playerId)?.awards.yixiu).toBe(1);
+    const afterSecond = second.body.room as RoomState;
+    expect(afterSecond.presentation).not.toBeNull();
 
     // 全员离线：立刻暂停、保存剩余时间、开始 24 小时计时
     game.hostSocket.socket.close();
@@ -1668,8 +1848,16 @@ describe('离线计时与过期归档', () => {
     const resumed = await reconnected.log.wait((room) => room.paused === false);
     expect(resumed.allOfflineSince).toBeNull();
     expect(resumed.expiresAt).toBeNull();
-    expect(resumed.deadline).toBeGreaterThan(env.clock.now);
     expect(resumed.status).toBe('playing');
+    // 恢复的是被暂停的那次结果展示：剩余时长大于零，且不重播（沿用同一条记录）
+    expect(resumed.presentation?.recordId).toBe(afterSecond.presentation?.recordId);
+    expect(resumed.presentation?.until).toBeGreaterThan(env.clock.now);
+    expect(resumed.deadline).toBeNull();
+
+    // 展示读完才轮到下一位，并给足完整三十秒
+    const handedOver = await readThroughPresentation(env, game.code, game.host.token);
+    expect(handedOver.turnPlayerId).toBe(game.host.playerId);
+    expect(handedOver.deadline! - env.clock.now).toBe(TURN_MS);
 
     // 活跃对局远超创建后 24 小时仍可继续，且不会被 tick 清理
     env.clock.now += 2 * DAY_MS;
@@ -1695,7 +1883,9 @@ describe('离线计时与过期归档', () => {
     const first = await startServer({ dataDir, clock, dice: [WUHONG, YIXIU] });
     const game = await startTwoPlayerGameWithSockets(first, { config: createDefaultRoomConfig() });
     const firstRoll = await rollOnce(first, game.code, game.host.token, game.room.turnId as string);
-    await rollOnce(first, game.code, game.guest.token, (firstRoll.body.room as RoomState).turnId as string);
+    expect(firstRoll.status).toBe(200);
+    const afterFirst = await readThroughPresentation(first, game.code, game.host.token);
+    await rollOnce(first, game.code, game.guest.token, afterFirst.turnId as string);
     game.hostSocket.socket.close();
     game.guestSocket.socket.close();
     await waitFor(async () => (await first.roomState(game.code, game.host.token)).paused === true);
@@ -1739,6 +1929,21 @@ describe('离线计时与过期归档', () => {
     expect(archived.champion?.playerId).toBe(game.host.playerId); // 候选保留但不结算
     expect(archived.pool.zhuangyuan).toBe(1);
     expect(archives[0]!.stateJson).not.toContain('tokenHash');
+    // 归档里不能留下已经无意义的进行中状态：展示与回合都清空，离线起点保留为事实
+    expect(archived.presentation).toBeNull();
+    expect(archived.deadline).toBeNull();
+    expect(archived.turnPlayerId).toBeNull();
+    expect(archived.turnId).toBeNull();
+    expect(archived.paused).toBe(false);
+    expect(archived.allOfflineSince).toBe(since);
+    // 过期不结算：历程保留投掷产生的事实，但不追加 settled，也不补发状元
+    expect(archived.championHistoryComplete).toBe(true);
+    expect(archived.championEvents.map((event) => event.kind)).toEqual(['first']);
+    expect(archived.championEvents.some((event) => event.kind === 'settled')).toBe(false);
+    // 个人最后结果随归档保留（独立于 240 条历史窗口）
+    expect(archived.players.find((player) => player.id === game.host.playerId)?.lastRoll?.result?.code).toBe('wuhong');
+    expect(archived.players.find((player) => player.id === game.guest.playerId)?.lastRoll?.result?.code).toBe('yixiu');
+    expect(archived.players.every((player) => player.lastRoll !== null)).toBe(true);
     rmSync(dataDir, { recursive: true, force: true });
   });
 
@@ -1825,6 +2030,8 @@ describe('结束归档', () => {
       const token = state.turnPlayerId === game.host.playerId ? game.host.token : game.guest.token;
       const rolled = await rollOnce(env, game.code, token, state.turnId as string);
       expect(rolled.status, `第 ${i + 1} 手`).toBe(200);
+      // 最后一手同样要读完展示阶段才结算（结算页不能吞掉最后一次结果）
+      await readThroughPresentation(env, game.code, game.host.token);
     }
     const finished = await env.roomState(game.code, game.host.token);
     expect(finished.status).toBe('finished');
@@ -1857,8 +2064,11 @@ describe('结束归档', () => {
     for (let i = 0; i < 10; i++) {
       const state = await env.roomState(game.code, game.host.token);
       if (state.status !== 'playing') break;
+      expect(state.deadline, `第 ${i + 1} 次超时前应处于回合计时中`).not.toBeNull();
       env.clock.now = state.deadline as number;
       env.instance.service.tick(env.clock.now);
+      // 超时同样进入展示阶段：读完展示才算轮转/结算完成
+      await readThroughPresentation(env, game.code, game.host.token);
     }
     const finished = await env.roomState(game.code, game.host.token);
     expect(finished.status).toBe('finished');
@@ -1889,5 +2099,806 @@ describe('结束归档', () => {
     expect(archives[0]!.reason).toBe('host-ended');
     expect(env.instance.db.counts().completedGames).toBe(1); // 旧表仍保留兼容记录
     expect(env.instance.db.counts().archives).toBe(1);
+  });
+});
+
+/**
+ * 以下为 2026-09-27「局内体验、数字房码与大厅旁观」的服务层验收：
+ * 结果展示阶段、房间节奏／访问设置、大厅、只读旁观与旧数据迁移。
+ */
+
+/** 确定性数字房码序列（六位，含前导零场景由调用方自行构造）。 */
+function numericCodeSequence(codes: string[]): () => string {
+  let index = 0;
+  return () => codes[index++] ?? codes[codes.length - 1]!;
+}
+
+const updatePacing = (env: TestEnv, code: string, token: string, pacing: unknown): Promise<ApiResult> =>
+  env.api('POST', `/api/rooms/${code}/actions`, { body: { type: 'update-pacing', pacing }, token });
+
+const updateAccess = (env: TestEnv, code: string, token: string, access: unknown): Promise<ApiResult> =>
+  env.api('POST', `/api/rooms/${code}/actions`, { body: { type: 'update-access', access }, token });
+
+describe('房间节奏与访问设置：默认、校验与权限（A03、L02）', () => {
+  it('省略 pacing／access 落到新房默认；显式非法一律 400 且不创建房间（回归）', async () => {
+    // 这条用例固定住一个真实缺陷：create 曾把“省略 access”当成非法配置直接返回 400。
+    const env = await startServer({ rateLimits: { createJoinPerMinute: 500 } });
+    const omitted = await env.api('POST', '/api/rooms', {
+      body: { nickname: '阿月', name: '中秋团圆局', maxPlayers: 2, maxRounds: 5 },
+    });
+    expect(omitted.status).toBe(201);
+    const created = omitted.body.room as RoomState;
+    expect(created.pacing).toEqual({ resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS });
+    expect(created.access).toEqual({ visibility: 'public', allowSpectators: true });
+    // 省略 pacing 与省略 access 是独立的：只给一项时另一项仍要落默认
+    const onlyPacing = await env.api('POST', '/api/rooms', {
+      body: { nickname: '阿月', name: '中秋团圆局', maxPlayers: 2, maxRounds: 5, pacing: { resultHoldSeconds: 0 } },
+    });
+    expect(onlyPacing.status).toBe(201);
+    expect((onlyPacing.body.room as RoomState).pacing).toEqual({ resultHoldSeconds: 0 });
+    expect((onlyPacing.body.room as RoomState).access).toEqual({ visibility: 'public', allowSpectators: true });
+    const onlyAccess = await env.api('POST', '/api/rooms', {
+      body: { nickname: '阿月', name: '中秋团圆局', maxPlayers: 2, maxRounds: 5, access: { visibility: 'invite', allowSpectators: false } },
+    });
+    expect(onlyAccess.status).toBe(201);
+    expect((onlyAccess.body.room as RoomState).pacing).toEqual({ resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS });
+    expect((onlyAccess.body.room as RoomState).access).toEqual({ visibility: 'invite', allowSpectators: false });
+
+    const loadedBefore = env.instance.service.loadedRoomCount();
+    const invalidAccess: unknown[] = [
+      null,
+      {},
+      { visibility: 'public' },
+      { allowSpectators: true },
+      { visibility: 'secret', allowSpectators: true },
+      { visibility: 'public', allowSpectators: 'yes' },
+      { visibility: 'public', allowSpectators: 1 },
+      [],
+    ];
+    for (const access of invalidAccess) {
+      const result = await env.api('POST', '/api/rooms', {
+        body: { nickname: '阿月', name: '中秋团圆局', maxPlayers: 2, maxRounds: 5, access },
+      });
+      expect(result.status, `access=${JSON.stringify(access)}`).toBe(400);
+      expect(result.body.error.code).toBe('INVALID_INPUT');
+    }
+    const invalidPacing: unknown[] = [
+      null,
+      {},
+      { resultHoldSeconds: 11 },
+      { resultHoldSeconds: -1 },
+      { resultHoldSeconds: 1.5 },
+      { resultHoldSeconds: '1' },
+      { resultHoldSeconds: true },
+      [],
+    ];
+    for (const pacing of invalidPacing) {
+      const result = await env.api('POST', '/api/rooms', {
+        body: { nickname: '阿月', name: '中秋团圆局', maxPlayers: 2, maxRounds: 5, pacing },
+      });
+      expect(result.status, `pacing=${JSON.stringify(pacing)}`).toBe(400);
+      expect(result.body.error.code).toBe('INVALID_INPUT');
+    }
+    // 非法配置在生成房码之前就被拒绝：不留下半个房间
+    expect(env.instance.service.loadedRoomCount()).toBe(loadedBefore);
+  });
+
+  it('显式合法的节奏与访问被接受，未知字段被丢弃', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, {
+      maxPlayers: 4,
+      pacing: { resultHoldSeconds: 0, extra: 'ignored' },
+      access: { visibility: 'invite', allowSpectators: true, extra: 'ignored' },
+    });
+    expect(created.room.pacing).toEqual({ resultHoldSeconds: 0 });
+    expect(created.room.access).toEqual({ visibility: 'invite', allowSpectators: true });
+    // 仅邀请不出现在大厅，但持有房码仍能访问概况与（允许时）旁观
+    const lobby = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect((lobby.body.rooms as LobbyRoomSummary[]).map((room) => room.code)).not.toContain(created.code);
+    const preview = await env.api('GET', `/api/rooms/${created.code}`);
+    expect(preview.body.access).toEqual({ visibility: 'invite', allowSpectators: true });
+    expect(preview.body.pacing).toEqual({ resultHoldSeconds: 0 });
+    const watch = await env.api('GET', `/api/rooms/${created.code}/watch`);
+    expect(watch.status).toBe(200);
+  });
+
+  it('只有未离席房主能改节奏与访问；无凭证 401、非房主 403、非法值不落盘', async () => {
+    const env = await startServer();
+    const waiting = await waitingRoomWithReadyGuest(env);
+    const before = waiting.room;
+
+    for (const result of [
+      await updatePacing(env, waiting.code, waiting.guest.token, { resultHoldSeconds: 3 }),
+      await updateAccess(env, waiting.code, waiting.guest.token, { visibility: 'invite', allowSpectators: false }),
+    ]) {
+      expect(result.status).toBe(403);
+      expect(result.body.error.code).toBe('HOST_ONLY');
+    }
+
+    const noToken = await env.api('POST', `/api/rooms/${waiting.code}/actions`, {
+      body: { type: 'update-pacing', pacing: { resultHoldSeconds: 2 } },
+    });
+    expect(noToken.status).toBe(401);
+    expect(noToken.body.error.code).toBe('INVALID_TOKEN');
+
+    for (const pacing of [{ resultHoldSeconds: 11 }, { resultHoldSeconds: 1.5 }, {}, null, undefined]) {
+      const result = await updatePacing(env, waiting.code, waiting.host.token, pacing);
+      expect(result.status, `pacing=${JSON.stringify(pacing)}`).toBe(400);
+      expect(result.body.error.code).toBe('INVALID_INPUT');
+    }
+    for (const access of [{ visibility: 'public' }, { visibility: 'public', allowSpectators: 1 }, null, undefined]) {
+      const result = await updateAccess(env, waiting.code, waiting.host.token, access);
+      expect(result.status, `access=${JSON.stringify(access)}`).toBe(400);
+      expect(result.body.error.code).toBe('INVALID_INPUT');
+    }
+    const unchanged = await env.roomState(waiting.code, waiting.host.token);
+    expect(unchanged.revision).toBe(before.revision);
+    expect(unchanged.pacing).toEqual(before.pacing);
+    expect(unchanged.access).toEqual(before.access);
+
+    // 没有实际变化不算改动：不递增 revision、不重置准备
+    const same = await updatePacing(env, waiting.code, waiting.host.token, { resultHoldSeconds: before.pacing.resultHoldSeconds });
+    expect(same.status).toBe(200);
+    expect((same.body.room as RoomState).revision).toBe(before.revision);
+    expect((same.body.room as RoomState).players.find((player) => player.id === waiting.guest.playerId)?.ready).toBe(true);
+  });
+
+  it('结束后（finished）房主仍可调整节奏与访问，供下一局沿用', async () => {
+    const env = await startServer();
+    const game = await startTwoPlayerGame(env);
+    const ended = await env.api('POST', `/api/rooms/${game.code}/actions`, { body: { type: 'end' }, token: game.host.token });
+    expect(ended.status).toBe(200);
+    expect((ended.body.room as RoomState).status).toBe('finished');
+
+    const pacing = await updatePacing(env, game.code, game.host.token, { resultHoldSeconds: 4 });
+    expect(pacing.status).toBe(200);
+    expect((pacing.body.room as RoomState).pacing).toEqual({ resultHoldSeconds: 4 });
+    const access = await updateAccess(env, game.code, game.host.token, { visibility: 'invite', allowSpectators: false });
+    expect(access.status).toBe(200);
+    expect((access.body.room as RoomState).access).toEqual({ visibility: 'invite', allowSpectators: false });
+
+    const rematch = await env.api('POST', `/api/rooms/${game.code}/actions`, { body: { type: 'rematch' }, token: game.host.token });
+    expect(rematch.status).toBe(200);
+    const waiting = rematch.body.room as RoomState;
+    expect(waiting.status).toBe('waiting');
+    expect(waiting.pacing).toEqual({ resultHoldSeconds: 4 });
+    expect(waiting.access).toEqual({ visibility: 'invite', allowSpectators: false });
+  });
+
+  it('改节奏不重置准备、库存、到期时间与进行中的展示，且从下一条记录生效', async () => {
+    const env = await startServer();
+    const game = await startTwoPlayerGame(env);
+    const rolled = await rollOnce(env, game.code, game.host.token, game.room.turnId as string);
+    expect(rolled.status).toBe(200);
+    const during = rolled.body.room as RoomState;
+    expect(during.presentation?.until).toBe(env.clock.now + DICE_REVEAL_MS + DEFAULT_RESULT_HOLD_SECONDS * 1000);
+    const poolBefore = during.pool;
+
+    const updated = await updatePacing(env, game.code, game.host.token, { resultHoldSeconds: 5 });
+    expect(updated.status).toBe(200);
+    const after = updated.body.room as RoomState;
+    expect(after.pacing).toEqual({ resultHoldSeconds: 5 });
+    // 正在进行的结果展示原样保留：节奏只影响下一条记录
+    expect(after.presentation).toEqual(during.presentation);
+    expect(after.deadline).toBeNull();
+    expect(after.expiresAt).toBeNull();
+    expect(after.pool).toEqual(poolBefore);
+    expect(after.history).toHaveLength(1);
+    expect(after.players.find((player) => player.id === game.host.playerId)?.rollCount).toBe(1);
+
+    // 展示仍按旧节奏结束，读完才轮到下一位
+    const handedOver = await readThroughPresentation(env, game.code, game.host.token);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    expect(handedOver.deadline! - env.clock.now).toBe(TURN_MS);
+
+    // 下一条记录使用新节奏：动画 750ms + 5 秒停留
+    const next = await rollOnce(env, game.code, game.guest.token, handedOver.turnId as string);
+    expect(next.status).toBe(200);
+    expect((next.body.room as RoomState).presentation?.until).toBe(env.clock.now + DICE_REVEAL_MS + 5_000);
+  });
+
+  it('改访问设置不重置准备、库存与回合；关闭旁观立即撤销旁观入口', async () => {
+    const env = await startServer();
+    const waiting = await waitingRoomWithReadyGuest(env);
+    const before = waiting.room;
+    const updated = await updateAccess(env, waiting.code, waiting.host.token, { visibility: 'invite', allowSpectators: false });
+    expect(updated.status).toBe(200);
+    const after = updated.body.room as RoomState;
+    expect(after.access).toEqual({ visibility: 'invite', allowSpectators: false });
+    expect(after.players.find((player) => player.id === waiting.guest.playerId)?.ready).toBe(true);
+    expect(after.pool).toEqual(before.pool);
+    expect(after.pacing).toEqual(before.pacing);
+    expect(after.expiresAt).toBe(before.expiresAt);
+    expect(after.status).toBe('waiting');
+
+    const watch = await env.api('GET', `/api/rooms/${waiting.code}/watch`);
+    expect(watch.status).toBe(403);
+    expect(watch.body.error.code).toBe('SPECTATING_DISABLED');
+    const lobby = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect((lobby.body.rooms as LobbyRoomSummary[]).map((room) => room.code)).not.toContain(waiting.code);
+    // 仅邀请只影响大厅：持有链接的人仍能看到概况
+    expect((await env.api('GET', `/api/rooms/${waiting.code}`)).status).toBe(200);
+  });
+});
+
+describe('游戏大厅（GET /api/rooms）', () => {
+  it('默认只列可加入的公开房间，摘要不含成员信息与凭证', async () => {
+    const env = await startServer();
+    const open = await createRoom(env, { maxPlayers: 4 });
+    await createRoom(env, { nickname: '阿桂', maxPlayers: 4, access: { visibility: 'invite', allowSpectators: true } });
+    const full = await createRoom(env, { nickname: '阿明', maxPlayers: 2 });
+    await joinRoom(env, full.code, '小满');
+    const playing = await createRoom(env, { nickname: '小月', maxPlayers: 2 });
+    const playingGuest = await joinRoom(env, playing.code, '小饼');
+    env.instance.service.connectMember(playing.code, playing.membership.token);
+    env.instance.service.connectMember(playing.code, playingGuest.membership.token);
+    await env.api('POST', `/api/rooms/${playing.code}/actions`, { body: { type: 'ready', ready: true }, token: playingGuest.membership.token });
+    const started = await env.api('POST', `/api/rooms/${playing.code}/actions`, { body: { type: 'start' }, token: playing.membership.token });
+    expect(started.status).toBe(200);
+
+    const joinable = await env.api('GET', '/api/rooms');
+    expect(joinable.status).toBe(200);
+    expect((joinable.body.rooms as LobbyRoomSummary[]).map((room) => room.code)).toEqual([open.code]);
+    expect(joinable.body.nextCursor).toBeNull();
+    expect(joinable.body.rooms[0]).toEqual({
+      code: open.code,
+      name: '中秋团圆局',
+      status: 'waiting',
+      playerCount: 1,
+      onlinePlayerCount: 0,
+      maxPlayers: 4,
+      rulesetName: open.room.ruleset.name,
+      endCondition: open.room.config.endCondition,
+      canJoin: true,
+      allowSpectators: true,
+      createdAt: open.room.createdAt,
+    });
+    assertNoSecrets(joinable.body, open.membership.token);
+    expect(JSON.stringify(joinable.body)).not.toContain('阿月'); // 不含玩家昵称
+    expect(joinable.body.rooms[0].players).toBeUndefined(); // 不展开成员列表
+
+    const all = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect((all.body.rooms as LobbyRoomSummary[]).map((room) => room.code).sort()).toEqual(
+      [open.code, full.code, playing.code].sort(),
+    );
+    const playingOnly = await env.api('GET', '/api/rooms?filter=playing&limit=50');
+    expect((playingOnly.body.rooms as LobbyRoomSummary[]).map((room) => room.code)).toEqual([playing.code]);
+    expect(playingOnly.body.rooms[0].canJoin).toBe(false);
+    expect(playingOnly.body.rooms[0].onlinePlayerCount).toBe(2);
+  });
+
+  it('finished／closed／过期房间不出现在大厅；重开后回到 waiting', async () => {
+    const env = await startServer();
+    const game = await startTwoPlayerGameWithSockets(env);
+    const ended = await env.api('POST', `/api/rooms/${game.code}/actions`, { body: { type: 'end' }, token: game.host.token });
+    expect(ended.status).toBe(200);
+    const afterEnd = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect((afterEnd.body.rooms as LobbyRoomSummary[]).map((room) => room.code)).not.toContain(game.code);
+
+    const rematch = await env.api('POST', `/api/rooms/${game.code}/actions`, { body: { type: 'rematch' }, token: game.host.token });
+    expect(rematch.status).toBe(200);
+    const afterRematch = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    const listed = (afterRematch.body.rooms as LobbyRoomSummary[]).find((room) => room.code === game.code);
+    expect(listed?.status).toBe('waiting');
+
+    // 全员离开（等待室）会关闭房间，从大厅消失
+    await env.api('POST', `/api/rooms/${game.code}/actions`, { body: { type: 'leave' }, token: game.guest.token });
+    const closed = await env.api('POST', `/api/rooms/${game.code}/actions`, { body: { type: 'leave' }, token: game.host.token });
+    expect(closed.status).toBe(200);
+    expect((closed.body.room as RoomState).status).toBe('closed');
+    const afterClose = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect((afterClose.body.rooms as LobbyRoomSummary[]).map((room) => room.code)).not.toContain(game.code);
+
+    // 已过期的房间也不列出
+    env.clock.now += DAY_MS + 1;
+    env.instance.service.tick(env.clock.now);
+    const afterExpiry = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect(afterExpiry.body.rooms).toEqual([]);
+    expect(afterExpiry.body.nextCursor).toBeNull();
+  });
+
+  it('默认 limit=20，cursor 为 {createdAt,code}：翻页不重叠、不遗漏', async () => {
+    const env = await startServer({ createRoomCode: numericCodeSequence(Array.from({ length: 21 }, (_, i) => String(700000 + i))) });
+    for (let i = 0; i < 21; i++) await createRoom(env, { nickname: '阿月', maxPlayers: 4 });
+
+    const page1 = await env.api('GET', '/api/rooms?filter=all');
+    expect(page1.body.rooms).toHaveLength(20);
+    expect(page1.body.nextCursor).not.toBeNull();
+    const page2 = await env.api('GET', `/api/rooms?filter=all&cursor=${encodeURIComponent(page1.body.nextCursor as string)}`);
+    expect(page2.body.rooms).toHaveLength(1);
+    expect(page2.body.nextCursor).toBeNull();
+    const codes = [...page1.body.rooms, ...page2.body.rooms].map((room: LobbyRoomSummary) => room.code);
+    expect(new Set(codes).size).toBe(21);
+    // createdAt 相同时按 code 升序，顺序稳定
+    expect(codes).toEqual([...codes].sort());
+
+    // limit 用尽且没有更多结果时不给出 cursor
+    const single = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect(single.body.rooms).toHaveLength(21);
+    expect(single.body.nextCursor).toBeNull();
+  });
+
+  it('limit 与 filter 越界、cursor 不合法一律 400 INVALID_INPUT', async () => {
+    const env = await startServer();
+    await createRoom(env, { maxPlayers: 4 });
+    const bad = [
+      '?limit=0',
+      '?limit=51',
+      '?limit=abc',
+      '?limit=2.5',
+      '?filter=weird',
+      '?filter=',
+      '?cursor=bm90anNvbg', // base64url("notjson")
+      '?cursor=%7B%22createdAt%22%3A1%2C%22code%22%3A%22ABC%22%7D',
+    ];
+    for (const query of bad) {
+      const result = await env.api('GET', `/api/rooms${query}`);
+      expect(result.status, query).toBe(400);
+      expect(result.body.error.code).toBe('INVALID_INPUT');
+    }
+  });
+
+  it('大厅遍历持久化目录而不是内存缓存，且不改变房间状态', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, { maxPlayers: 4 });
+    const before = await env.roomState(created.code, created.membership.token);
+
+    // 另一个服务实例视角：同一数据库、空缓存
+    const other = new RoomService({ db: env.instance.db, now: () => env.clock.now });
+    const page = other.listLobby({ filter: 'all', limit: 20, cursor: null });
+    expect(page.rooms.map((room) => room.code)).toEqual([created.code]);
+
+    const after = await env.roomState(created.code, created.membership.token);
+    expect(after.revision).toBe(before.revision);
+    expect(after.expiresAt).toBe(before.expiresAt);
+  });
+});
+
+describe('只读旁观入口（GET /api/rooms/:code/watch）', () => {
+  it('不需要成员凭证，也不改变在线状态、到期时间或 revision', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, { maxPlayers: 4 });
+    const before = created.room;
+    expect(before.access.allowSpectators).toBe(true);
+
+    const watcher = await env.api('GET', `/api/rooms/${created.code}/watch`);
+    expect(watcher.status).toBe(200);
+    const watched = watcher.body.room as RoomState;
+    expect(watched.code).toBe(created.code);
+    expect(watched.revision).toBe(before.revision);
+    expect(watched.players.every((player) => !player.online)).toBe(true);
+    expect(watched.expiresAt).toBe(before.expiresAt);
+    assertNoSecrets(watched, created.membership.token);
+
+    // 多次旁观、切换角色都不会续期或改变离线起点
+    env.clock.now += 3600 * 1000;
+    await env.api('GET', `/api/rooms/${created.code}/watch`);
+    const state = await env.roomState(created.code, created.membership.token);
+    expect(state.expiresAt).toBe(before.expiresAt);
+    expect(state.revision).toBe(before.revision);
+  });
+
+  it('关闭旁观 403、房间不存在 404、房码非法 400、已过期 410', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, {
+      maxPlayers: 4,
+      access: { visibility: 'public', allowSpectators: false },
+    });
+    const disabled = await env.api('GET', `/api/rooms/${created.code}/watch`);
+    expect(disabled.status).toBe(403);
+    expect(disabled.body.error.code).toBe('SPECTATING_DISABLED');
+
+    const unknown = await env.api('GET', '/api/rooms/654321/watch');
+    expect(unknown.status).toBe(404);
+    expect(unknown.body.error.code).toBe('ROOM_NOT_FOUND');
+
+    const bad = await env.api('GET', '/api/rooms/ABCDE0/watch');
+    expect(bad.status).toBe(400);
+    expect(bad.body.error.code).toBe('INVALID_INPUT');
+
+    env.clock.now += DAY_MS + 1;
+    const expired = await env.api('GET', `/api/rooms/${created.code}/watch`);
+    expect(expired.status).toBe(410);
+    expect(expired.body.error.code).toBe('ROOM_EXPIRED');
+  });
+
+  it('已关闭的房间不允许旁观', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, { maxPlayers: 4 });
+    const left = await env.api('POST', `/api/rooms/${created.code}/actions`, { body: { type: 'leave' }, token: created.membership.token });
+    expect((left.body.room as RoomState).status).toBe('closed');
+    const watch = await env.api('GET', `/api/rooms/${created.code}/watch`);
+    expect(watch.status).toBe(409);
+    expect(watch.body.error.code).toBe('INVALID_STATE');
+  });
+});
+
+describe('观众连接：只读、去重计数与撤销（L04、L05、L06）', () => {
+  it('未知 role 被拒绝，成员凭证失败不会被降级成观众', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, { maxPlayers: 4 });
+
+    const unknownRole = await connectFailure(env, { role: 'moderator', roomCode: created.code });
+    expect(unknownRole.data?.code).toBe('INVALID_INPUT');
+
+    // 没有 role 且凭证错误：按成员处理并拒绝，不能悄悄变成只读观众
+    const badToken = await connectFailure(env, { roomCode: created.code, token: 'c'.repeat(64) });
+    expect(badToken.data?.code).toBe('INVALID_TOKEN');
+    const explicitMember = await connectFailure(env, { role: 'member', roomCode: created.code, token: 'c'.repeat(64) });
+    expect(explicitMember.data?.code).toBe('INVALID_TOKEN');
+    const missingToken = await connectFailure(env, { role: 'member', roomCode: created.code });
+    expect(missingToken.data?.code).toBe('INVALID_TOKEN');
+
+    // 观众必须带 viewerId；未知房间也要拒绝
+    const noViewer = await connectFailure(env, { role: 'spectator', roomCode: created.code });
+    expect(noViewer.data?.code).toBe('INVALID_INPUT');
+    const unknownRoom = await connectFailure(env, { role: 'spectator', roomCode: '654321', viewerId: crypto.randomUUID() });
+    expect(unknownRoom.data?.code).toBe('ROOM_NOT_FOUND');
+
+    // 关闭旁观的房间拒绝观众订阅
+    const disabled = await createRoom(env, { nickname: '阿桂', access: { visibility: 'invite', allowSpectators: false } });
+    const refused = await connectFailure(env, { role: 'spectator', roomCode: disabled.code, viewerId: crypto.randomUUID() });
+    expect(refused.data?.code).toBe('SPECTATING_DISABLED');
+  });
+
+  it('同一 viewerId 的多连接只算一位访客，人数事件不改变游戏 revision', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, { maxPlayers: 4 });
+    const memberSocket = await connectSocket(env, { roomCode: created.code, token: created.membership.token });
+    await memberSocket.log.wait((room) => room.players[0]?.online === true);
+    const memberAudience: AudienceState[] = [];
+    memberSocket.socket.on(SOCKET_EVENT_AUDIENCE, (payload: AudienceState) => memberAudience.push(payload));
+
+    const before = await env.roomState(created.code, created.membership.token);
+    const viewerId = crypto.randomUUID();
+    const first = await connectSpectator(env, created.code, viewerId);
+    await first.log.wait((room) => room.code === created.code);
+    const second = await connectSpectator(env, created.code, viewerId);
+    await second.log.wait((room) => room.code === created.code);
+    const other = await connectSpectator(env, created.code);
+    await other.log.wait((room) => room.code === created.code);
+
+    await waitFor(() => env.instance.hub.audienceCount(created.code) === 2);
+    await waitFor(() => first.audience.some((payload) => payload.viewerCount === 2));
+    await waitFor(() => memberAudience.some((payload) => payload.viewerCount === 2));
+    const audience = first.audience.at(-1);
+    expect(audience).toEqual({ roomCode: created.code, viewerCount: 2 }); // 只含去重人数，没有身份信息
+
+    // 观众连接不占席位、不改变游戏快照
+    expect(await env.roomState(created.code, created.membership.token)).toEqual(before);
+    expect(env.instance.hub.connectedCount(created.code)).toBe(1); // 成员频道里只有房主
+
+    // 关掉同一访客的其中一个连接：人数不变
+    second.socket.close();
+    await waitFor(() => second.socket.connected === false);
+    expect(env.instance.hub.audienceCount(created.code)).toBe(2);
+    // 全部关掉后归零（在线的成员连接会收到最后一条人数事件）
+    first.socket.close();
+    other.socket.close();
+    await waitFor(() => env.instance.hub.audienceCount(created.code) === 0);
+    await waitFor(() => memberAudience.at(-1)?.viewerCount === 0);
+  });
+
+  it('观众标识不是成员凭证：不能读取成员状态或提交任何动作', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, { maxPlayers: 4 });
+    const spectator = await connectSpectator(env, created.code);
+    await spectator.log.wait((room) => room.code === created.code);
+
+    const state = await env.api('GET', `/api/rooms/${created.code}/state`, { token: spectator.viewerId });
+    expect(state.status).toBe(401);
+    expect(state.body.error.code).toBe('INVALID_TOKEN');
+
+    for (const body of [{ type: 'ready', ready: true }, { type: 'start' }, { type: 'rematch' }, { type: 'end' }]) {
+      const result = await env.api('POST', `/api/rooms/${created.code}/actions`, { body, token: spectator.viewerId });
+      expect(result.status, JSON.stringify(body)).toBe(401);
+      expect(result.body.error.code).toBe('INVALID_TOKEN');
+    }
+    // viewerId 也不是房码或凭证哈希：换一个房间同样无效
+    const other = await createRoom(env, { nickname: '阿桂', maxPlayers: 4 });
+    const crossRoom = await env.api('GET', `/api/rooms/${other.code}/state`, { token: spectator.viewerId });
+    expect(crossRoom.status).toBe(401);
+
+    const room = await env.roomState(created.code, created.membership.token);
+    expect(room.players).toHaveLength(1);
+    expect(room.players.every((player) => !player.online)).toBe(true);
+  });
+
+  it('观众在线不阻止全员离线暂停，也不延长到期时间；观众刷新不影响离线起点', async () => {
+    const env = await startServer();
+    const game = await startTwoPlayerGameWithSockets(env);
+    const spectator = await connectSpectator(env, game.code);
+    await spectator.log.wait((room) => room.code === game.code);
+    expect(env.instance.hub.audienceCount(game.code)).toBe(1);
+
+    game.hostSocket.socket.close();
+    game.guestSocket.socket.close();
+    await waitFor(async () => (await env.roomState(game.code, game.host.token)).paused === true);
+    const offline = await env.roomState(game.code, game.host.token);
+    expect(offline.paused).toBe(true);
+    expect(offline.allOfflineSince).toBe(env.clock.now);
+    expect(offline.expiresAt).toBe(env.clock.now + DAY_MS);
+    expect(offline.deadline).toBeNull();
+
+    // 观众还在看：刷新连接不改变离线起点与到期时间
+    spectator.socket.close();
+    await waitFor(() => env.instance.hub.audienceCount(game.code) === 0);
+    const again = await connectSpectator(env, game.code);
+    await again.log.wait((room) => room.code === game.code);
+    env.clock.now += 3600 * 1000;
+    env.instance.service.tick(env.clock.now);
+    const after = await env.roomState(game.code, game.host.token);
+    expect(after.allOfflineSince).toBe(offline.allOfflineSince);
+    expect(after.expiresAt).toBe(offline.expiresAt);
+    expect(after.paused).toBe(true);
+    expect(after.status).toBe('playing');
+  });
+
+  it('房主关闭旁观：先发 watch-ended 再断开观众，成员连接不受影响，之后不再推快照', async () => {
+    const env = await startServer();
+    const game = await startTwoPlayerGameWithSockets(env);
+    const spectator = await connectSpectator(env, game.code);
+    await spectator.log.wait((room) => room.code === game.code);
+    const guestMarker = game.guestSocket.log.mark();
+
+    const updated = await updateAccess(env, game.code, game.host.token, { visibility: 'public', allowSpectators: false });
+    expect(updated.status).toBe(200);
+    await waitFor(() => spectator.ended.length === 1);
+    expect(spectator.ended[0]?.code).toBe('SPECTATING_DISABLED');
+    await waitFor(() => spectator.socket.connected === false);
+    await waitFor(() => env.instance.hub.audienceCount(game.code) === 0);
+    // 成员照常在线并收到新设置
+    expect(game.hostSocket.socket.connected).toBe(true);
+    expect(game.guestSocket.socket.connected).toBe(true);
+    const memberRoom = await game.guestSocket.log.wait((room) => room.access.allowSpectators === false, { after: guestMarker });
+    expect(memberRoom.access.visibility).toBe('public');
+
+    // 撤销之后房间继续推进，也不再推给已断开的观众
+    const spectatorSnapshots = spectator.log.all.length;
+    const guestSnapshots = game.guestSocket.log.all.length;
+    env.clock.now += TURN_MS;
+    env.instance.service.tick(env.clock.now);
+    await waitFor(async () => (await env.roomState(game.code, game.host.token)).history.length >= 1);
+    expect(spectator.log.all.length).toBe(spectatorSnapshots);
+    expect(game.guestSocket.log.all.length).toBeGreaterThan(guestSnapshots);
+  });
+
+  it('房间到期清理会先说明原因再断开观众连接', async () => {
+    const env = await startServer();
+    const created = await createRoom(env, { maxPlayers: 4 });
+    const spectator = await connectSpectator(env, created.code);
+    await spectator.log.wait((room) => room.code === created.code);
+
+    env.clock.now += DAY_MS + 1;
+    env.instance.service.tick(env.clock.now);
+    await waitFor(() => spectator.ended.length === 1);
+    expect(spectator.ended[0]?.code).toBe('ROOM_EXPIRED');
+    await waitFor(() => spectator.socket.connected === false);
+    expect(env.instance.hub.audienceCount(created.code)).toBe(0);
+    expect(env.instance.db.getRoom(created.code)).toBeNull();
+  });
+});
+
+describe('结果展示阶段的时序边界（E03、E04）', () => {
+  it('0 秒停留：保留掷骰动画，动画结束后立即交给下一位；超时 0 秒同一 tick 内完成', async () => {
+    const env = await startServer({ dice: [NONE] });
+    const game = await startTwoPlayerGame(env);
+    const set = await updatePacing(env, game.code, game.host.token, { resultHoldSeconds: 0 });
+    expect(set.status).toBe(200);
+
+    const rolled = await rollOnce(env, game.code, game.host.token, game.room.turnId as string);
+    expect(rolled.status).toBe(200);
+    expect((rolled.body.room as RoomState).presentation?.until).toBe(env.clock.now + DICE_REVEAL_MS);
+    // 动画没走完就不能开下一手
+    expect(env.instance.service.tick(env.clock.now + DICE_REVEAL_MS - 1)).toEqual([]);
+    env.clock.now += DICE_REVEAL_MS;
+    expect(env.instance.service.tick(env.clock.now)).toEqual([game.code]);
+    const handedOver = await env.roomState(game.code, game.host.token);
+    expect(handedOver.presentation).toBeNull();
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    expect(handedOver.deadline! - env.clock.now).toBe(TURN_MS);
+
+    // 超时没有动画：0 秒停留允许在同一 tick 内完成展示并交给下一位
+    env.clock.now = handedOver.deadline as number;
+    expect(env.instance.service.tick(env.clock.now)).toEqual([game.code]);
+    const afterTimeout = await env.roomState(game.code, game.host.token);
+    expect(afterTimeout.history.filter((record) => record.reason === 'timeout')).toHaveLength(1);
+    expect(afterTimeout.presentation).toBeNull();
+    expect(afterTimeout.turnPlayerId).toBe(game.host.playerId);
+    expect(afterTimeout.round).toBe(2);
+    expect(afterTimeout.deadline! - env.clock.now).toBe(TURN_MS);
+  });
+
+  it('10 秒停留是上限：下一手在动画加停留之后才开放，且拿到完整三十秒', async () => {
+    const env = await startServer({ dice: [NONE] });
+    const game = await startTwoPlayerGame(env);
+    expect((await updatePacing(env, game.code, game.host.token, { resultHoldSeconds: 10 })).status).toBe(200);
+
+    const rolled = await rollOnce(env, game.code, game.host.token, game.room.turnId as string);
+    expect(rolled.status).toBe(200);
+    const until = (rolled.body.room as RoomState).presentation?.until as number;
+    expect(until).toBe(env.clock.now + DICE_REVEAL_MS + 10_000);
+    expect((await updatePacing(env, game.code, game.host.token, { resultHoldSeconds: 11 })).status).toBe(400);
+
+    expect(env.instance.service.tick(until - 1)).toEqual([]);
+    env.clock.now = until;
+    expect(env.instance.service.tick(env.clock.now)).toEqual([game.code]);
+    const handedOver = await env.roomState(game.code, game.host.token);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    expect(handedOver.deadline! - env.clock.now).toBe(TURN_MS);
+  });
+
+  it('展示期间其他玩家不能抢先掷骰，读完后拿到新的 turnId', async () => {
+    const env = await startServer();
+    const game = await startTwoPlayerGame(env);
+    const rolled = await rollOnce(env, game.code, game.host.token, game.room.turnId as string);
+    expect(rolled.status).toBe(200);
+    const during = rolled.body.room as RoomState;
+
+    const early = await rollOnce(env, game.code, game.guest.token, during.turnId as string);
+    expect(early.status).toBe(409);
+    expect(early.body.error.code).toBe('RESULT_SHOWING');
+    expect((await env.roomState(game.code, game.host.token)).history).toHaveLength(1);
+
+    const handedOver = await readThroughPresentation(env, game.code, game.host.token);
+    expect(handedOver.turnId).not.toBe(during.turnId);
+    expect(handedOver.turnPlayerId).toBe(game.guest.playerId);
+    const next = await rollThrough(env, game.code, game.guest.token, handedOver.turnId as string);
+    expect(next.history).toHaveLength(2);
+    expect(next.presentation).toBeNull();
+    expect(next.round).toBe(2);
+    expect(next.turnPlayerId).toBe(game.host.playerId);
+    expect(next.deadline! - env.clock.now).toBe(TURN_MS);
+  });
+
+  it('公开快照与归档保留个人最后结果与完整状元历程，且不含凭证', async () => {
+    const env = await startServer({ dice: [DUITANG, SANHONG, SIJIN, ERJU, YIXIU, WUHONG] });
+    const config = createDefaultRoomConfig();
+    for (const key of PRIZE_KEYS) config.prizes[key] = { count: 1, content: `奖品-${key}` };
+    const game = await startTwoPlayerGameWithSockets(env, { config });
+    for (let i = 0; i < 6; i++) {
+      const state = await env.roomState(game.code, game.host.token);
+      const token = state.turnPlayerId === game.host.playerId ? game.host.token : game.guest.token;
+      expect((await rollOnce(env, game.code, token, state.turnId as string)).status, `第 ${i + 1} 手`).toBe(200);
+      await readThroughPresentation(env, game.code, game.host.token);
+    }
+    const finished = await env.roomState(game.code, game.host.token);
+    expect(finished.status).toBe('finished');
+    expect(finished.championHistoryComplete).toBe(true);
+    expect(finished.championEvents.map((event) => event.kind)).toEqual(['first', 'settled']);
+    const settled = finished.championEvents.find((event) => event.kind === 'settled');
+    expect(settled?.awardedCount).toBe(1);
+    expect(settled?.recordId).toBeNull();
+    // 每人的个人最后结果独立保留，最后一手是客人的状元记录
+    const hostLast = finished.players.find((player) => player.id === game.host.playerId)?.lastRoll;
+    const guestLast = finished.players.find((player) => player.id === game.guest.playerId)?.lastRoll;
+    expect(hostLast?.result?.code).toBe('yixiu');
+    expect(guestLast?.result?.code).toBe('wuhong');
+    expect(guestLast?.championOutcome?.kind).toBe('first');
+    assertNoSecrets(finished, game.host.token);
+
+    const archives = env.instance.db.listArchives(game.code, finished.createdAt);
+    expect(archives).toHaveLength(1);
+    expect(archives[0]!.stateJson).not.toContain('tokenHash');
+    const archived = JSON.parse(archives[0]!.stateJson) as RoomState;
+    expect(archived.presentation).toBeNull();
+    expect(archived.deadline).toBeNull();
+    expect(archived.championHistoryComplete).toBe(true);
+    expect(archived.championEvents.map((event) => event.kind)).toEqual(['first', 'settled']);
+    expect(archived.players.find((player) => player.id === game.guest.playerId)?.lastRoll?.result?.code).toBe('wuhong');
+  });
+});
+
+describe('旧数据迁移在服务层的表现（L02 兼容）', () => {
+  /** 旧格式（无 config、有 maxRounds）的房间快照：模拟升级前已经存在的房间。 */
+  function legacyRoomSnapshot(token: string, at: number): Record<string, unknown> {
+    return {
+      code: 'LEGACY',
+      name: '旧局',
+      maxPlayers: 2,
+      maxRounds: 10,
+      rulesVersion: 'unified-v1',
+      status: 'playing',
+      hostId: 'legacy-host',
+      revision: 7,
+      players: [
+        {
+          id: 'legacy-host',
+          nickname: '老房主',
+          seat: 0,
+          ready: true,
+          online: true,
+          left: false,
+          awards: { zhuangyuan: 0, duitang: 1, sanhong: 0, sijin: 0, erju: 0, yixiu: 2 },
+          best: { code: 'duitang', label: '对堂', prize: 'duitang', rankKey: [6, 0, 0] },
+          tokenHash: hashToken(token),
+          lastSeenAt: at,
+        },
+        {
+          id: 'legacy-guest',
+          nickname: '老客人',
+          seat: 1,
+          ready: true,
+          online: false,
+          left: false,
+          awards: { zhuangyuan: 0, duitang: 0, sanhong: 0, sijin: 0, erju: 0, yixiu: 0 },
+          best: null,
+          tokenHash: hashToken('legacy-guest-token'),
+          lastSeenAt: at,
+        },
+      ],
+      gameNumber: 2,
+      round: 4,
+      turnPlayerId: 'legacy-guest',
+      turnId: '11111111-1111-4111-8111-111111111111',
+      deadline: at + TURN_MS,
+      paused: false,
+      pool: { zhuangyuan: 1, duitang: 1, sanhong: 4, sijin: 8, erju: 16, yixiu: 30 },
+      champion: null,
+      history: [
+        { id: 'lr1', playerId: 'legacy-host', nickname: '老房主', round: 1, turnId: 'a', dice: DUITANG, result: null, awarded: 'duitang', reason: 'rolled', at: at - 3 },
+        { id: 'lr2', playerId: 'legacy-guest', nickname: '老客人', round: 1, turnId: 'b', dice: NONE, result: null, awarded: null, reason: 'timeout', at: at - 2 },
+        {
+          id: 'lr3',
+          playerId: 'legacy-host',
+          nickname: '老房主',
+          round: 3,
+          turnId: 'c',
+          dice: WUHONG,
+          result: { code: 'wuhong', label: '五红', prize: 'zhuangyuan', rankKey: [8, 6, 0] },
+          awarded: null,
+          reason: 'rolled',
+          at: at - 1,
+        },
+      ],
+      pendingFinish: null,
+      finishedReason: null,
+      createdAt: at - DAY_MS,
+      expiresAt: null,
+    };
+  }
+
+  it('旧房间迁移为仅邀请并关闭旁观：不出现在大厅、不开放旁观、不伪造登顶事实', async () => {
+    // 真实升级路径：旧行先落库，服务重启时由 onBoot 归一化并恢复
+    const bootstrap = await startServer();
+    const token = 'a'.repeat(64);
+    bootstrap.instance.db.saveRoom({
+      code: 'LEGACY',
+      stateJson: JSON.stringify(legacyRoomSnapshot(token, bootstrap.clock.now)),
+      expiresAt: null,
+      revision: 7,
+    });
+    await bootstrap.close();
+
+    const env = await startServer({ dataDir: bootstrap.dataDir, clock: bootstrap.clock });
+
+    // 用原凭证仍能进入（迁移不破坏身份），但新字段一律按旧数据规则补齐
+    const state = await env.roomState('LEGACY', token);
+    expect(state.status).toBe('playing');
+    expect(state.pacing).toEqual({ resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS });
+    expect(state.access).toEqual({ visibility: 'invite', allowSpectators: false });
+    expect(state.presentation).toBeNull();
+    expect(state.championHistoryComplete).toBe(false);
+    expect(state.championEvents).toEqual([]);
+    expect(state.champion).toBeNull();
+    // 个人最佳不等于登顶证据：保留 best，但最后结果标成 legacy-unknown
+    expect(state.players.find((player) => player.id === 'legacy-host')?.best?.code).toBe('duitang');
+    expect(state.players.find((player) => player.id === 'legacy-host')?.lastRoll?.id).toBe('lr3');
+    expect(state.players.find((player) => player.id === 'legacy-host')?.lastRoll?.championOutcome?.kind).toBe('legacy-unknown');
+    // 整局重启后进入暂停，但离线起点只记一次
+    expect(state.paused).toBe(true);
+    expect(state.allOfflineSince).toBe(env.clock.now);
+    expect(state.expiresAt).toBe(env.clock.now + DAY_MS);
+
+    // 旧房间不会自动公开，也不会因为“允许旁观”默认值而开放观看
+    const lobby = await env.api('GET', '/api/rooms?filter=all&limit=50');
+    expect((lobby.body.rooms as LobbyRoomSummary[]).map((room) => room.code)).not.toContain('LEGACY');
+    const watch = await env.api('GET', '/api/rooms/LEGACY/watch');
+    expect(watch.status).toBe(403);
+    expect(watch.body.error.code).toBe('SPECTATING_DISABLED');
+    // 概况仍可读，便于老链接继续使用
+    const preview = await env.api('GET', '/api/rooms/LEGACY');
+    expect(preview.status).toBe(200);
+    expect(preview.body.access).toEqual({ visibility: 'invite', allowSpectators: false });
   });
 });

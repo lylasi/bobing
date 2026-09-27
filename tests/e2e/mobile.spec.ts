@@ -20,6 +20,7 @@ import {
   isRollEnabled,
   joinByInvite,
   latestRecordDice,
+  openMoreMenuIfNeeded,
   playUntilFinished,
   readInviteUrl,
   rectOf,
@@ -140,6 +141,7 @@ test.describe('手机 375px', () => {
       // 先切回玩家 Tab：几何断言依赖面板真的可见（隐藏元素的矩形是 0）
       await host.getByRole('tab', { name: '玩家' }).click();
       await expect(host.locator('.player-list')).toBeVisible();
+      await openMoreMenuIfNeeded(host);
       await expect(host.locator('.room-header-actions .btn')).toHaveCount(5);
       const actionLines = await textLineCounts(host, '.room-header-actions .btn');
       expect(actionLines, '房间次操作文案被拆成了多行').toEqual([1, 1, 1, 1, 1]);
@@ -158,6 +160,12 @@ test.describe('手机 375px', () => {
       await expectNoHorizontalOverflow(host);
       expect(await textLineCounts(host, '.room-header-actions .btn')).toEqual([1, 1, 1, 1, 1]);
       await host.setViewportSize(PHONE);
+
+      // 收起更多面板，恢复紧凑单行顶部栏，确保首屏（不滚动）能完整展示碗、当前提示与最新结果
+      const moreBtn = host.locator('.room-more-btn');
+      if ((await moreBtn.getAttribute('aria-expanded')) === 'true') {
+        await moreBtn.click();
+      }
 
       // —— 截图：先回顶部、等碗停稳、点数与权威记录一致 ——
       await expect(host.locator('.player-list')).toBeVisible();

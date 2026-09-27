@@ -12,6 +12,8 @@ import type {
   Action,
   CreateRoomRequest,
   ErrorCode,
+  LobbyPage,
+  LobbyQuery,
   MemberStateResponse,
   RoomPreview,
   RoomResponse,
@@ -98,6 +100,7 @@ interface RequestOptions {
   body?: unknown;
   token?: string | null;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 function isErrorCode(value: unknown): value is ErrorCode {
@@ -108,7 +111,19 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   const method = options.method ?? 'GET';
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onExternalAbort = (): void => controller.abort();
+  if (options.signal) {
+    if (options.signal.aborted) {
+      clearTimeout(timer);
+      throw new ApiError('network', '请求已取消');
+    }
+    options.signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
   if (options.token) headers.Authorization = `Bearer ${options.token}`;
@@ -124,12 +139,17 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     });
   } catch (error) {
     clearTimeout(timer);
-    if (controller.signal.aborted) {
+    options.signal?.removeEventListener('abort', onExternalAbort);
+    if (timedOut) {
       throw new ApiError('timeout', '操作超时，请检查网络后重试');
+    }
+    if (controller.signal.aborted) {
+      throw new ApiError('network', '请求已取消');
     }
     throw new ApiError('network', '网络连接失败，请检查网络后重试');
   }
   clearTimeout(timer);
+  options.signal?.removeEventListener('abort', onExternalAbort);
   syncClockFrom(response, startedAt, Date.now());
 
   const text = await response.text().catch(() => '');
@@ -223,6 +243,21 @@ export function sendAction(code: string, token: string, action: Action): Promise
     method: 'POST',
     token,
     body: action,
+  });
+}
+
+export function fetchLobby(query: LobbyQuery, signal?: AbortSignal): Promise<LobbyPage> {
+  const params = new URLSearchParams();
+  params.set('filter', query.filter);
+  params.set('limit', String(query.limit));
+  if (query.cursor) params.set('cursor', query.cursor);
+  return request<LobbyPage>(`/api/rooms?${params.toString()}`, { timeoutMs: 8000, ...(signal ? { signal } : {}) });
+}
+
+export function fetchWatchState(code: string, signal?: AbortSignal): Promise<RoomResponse> {
+  return request<RoomResponse>(`/api/rooms/${encodeURIComponent(code)}/watch`, {
+    timeoutMs: 8000,
+    ...(signal ? { signal } : {}),
   });
 }
 

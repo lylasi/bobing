@@ -24,6 +24,7 @@ import {
   startGame,
   toggleReady,
   rollCount,
+  openMoreMenuIfNeeded,
 } from './helpers.js';
 import type { BrowserContext, Page } from '@playwright/test';
 
@@ -138,6 +139,26 @@ async function rollOnce(page: Page): Promise<void> {
   await button.click();
 }
 
+/**
+ * 等待权威轮转完成、展示期结束且有效行动玩家的掷骰按钮明确启用后，再返回当前投手与另一位玩家。
+ * 避免在展示期（双方按钮均被禁用）误判当前行动方。
+ */
+async function waitActiveRoller(
+  host: Page,
+  guest: Page,
+  timeout = 30_000,
+): Promise<{ roller: Page; other: Page }> {
+  await expect
+    .poll(async () => ((await isRollEnabled(host)) ? 'host' : (await isRollEnabled(guest)) ? 'guest' : null), {
+      timeout,
+    })
+    .not.toBeNull();
+  const hostCanRoll = await isRollEnabled(host);
+  const roller = hostCanRoll ? host : guest;
+  const other = hostCanRoll ? guest : host;
+  return { roller, other };
+}
+
 test.describe('骰子只跟随最新权威记录', () => {
   test('A 投完 B 立刻投，刷新第二投手页面后两端碗里都是最新权威点数；再开一局清空', async ({ browser }) => {
     test.setTimeout(240_000);
@@ -154,8 +175,7 @@ test.describe('骰子只跟随最新权威记录', () => {
       await startGame(host);
 
       // 第一位投手：投出第一条记录
-      const first = (await isRollEnabled(host)) ? host : guest;
-      const second = first === host ? guest : host;
+      const { roller: first, other: second } = await waitActiveRoller(host, guest);
       await rollOnce(first);
       await expect(host.locator('.record')).toHaveCount(1, { timeout: 30_000 });
       await expect(guest.locator('.record')).toHaveCount(1, { timeout: 30_000 });
@@ -230,8 +250,7 @@ test.describe('骰子只跟随最新权威记录', () => {
       await toggleReady(guest);
       await startGame(host);
 
-      const first = (await isRollEnabled(host)) ? host : guest;
-      const second = first === host ? guest : host;
+      const { roller: first, other: second } = await waitActiveRoller(host, guest);
       await rollOnce(first);
       await expect(host.locator('.record')).toHaveCount(1, { timeout: 30_000 });
       await expect(guest.locator('.record')).toHaveCount(1, { timeout: 30_000 });
@@ -265,11 +284,10 @@ test.describe('骰子只跟随最新权威记录', () => {
       const secondAuthority = await latestRecordDice(host);
       await expect.poll(async () => await bowlPips(second), { timeout: 20_000 }).toEqual(secondAuthority);
 
-      // 现在轮到第一位玩家：只改写“自己这一页”读到的权威快照，把本轮 deadline 放到过去，
-      // 模拟浏览器看到的倒计时已经归零；revision 抬高让本页不再被后续推送更新
+      // 现在轮到第一位玩家：等待展示期结束并权威确认当前行动方后，只改写“自己这一页”读到的权威快照，
+      // 把本轮 deadline 放到过去，模拟浏览器看到的倒计时已经归零；revision 抬高让本页不再被后续推送更新
       // （服务端状态、对手页面与真实规则完全不受影响）。
-      const roller = (await isRollEnabled(host)) ? host : guest;
-      const other = roller === host ? guest : host;
+      const { roller, other } = await waitActiveRoller(host, guest);
       await roller.route('**/api/rooms/*/state', async (route) => {
         const response = await route.fetch();
         const body = (await response.json()) as {
@@ -312,7 +330,7 @@ test.describe('骰子只跟随最新权威记录', () => {
       await startGame(host);
 
       // 先真实投一次，让结果区有“上一手”的内容
-      const roller = (await isRollEnabled(host)) ? host : guest;
+      const { roller } = await waitActiveRoller(host, guest);
       await rollOnce(roller);
       await expect(host.locator('.record')).toHaveCount(1, { timeout: 30_000 });
       await expect(guest.locator('.record')).toHaveCount(1, { timeout: 30_000 });
@@ -340,8 +358,8 @@ test.describe('骰子只跟随最新权威记录', () => {
       await expect(guest.locator('.record')).toHaveCount(2, { timeout: 30_000 });
       await expect.poll(async () => await bowlPips(guest), { timeout: 20_000 }).toEqual(authority);
 
-      // 超时后轮到另一位玩家，可以正常继续投掷
-      const next = (await isRollEnabled(host)) ? host : guest;
+      // 超时后轮到另一位玩家，等待展示期/轮转完成且按钮明确启用后继续投掷
+      const { roller: next } = await waitActiveRoller(host, guest);
       await rollOnce(next);
       await expect(host.locator('.record')).toHaveCount(3, { timeout: 30_000 });
       const nextAuthority = await latestRecordDice(host);
@@ -402,15 +420,16 @@ test.describe('骰子只跟随最新权威记录', () => {
       await toggleReady(guest);
       await startGame(host);
 
-      const first = (await isRollEnabled(host)) ? host : guest;
-      const second = first === host ? guest : host;
+      const { roller: first, other: second } = await waitActiveRoller(host, guest);
 
       // 1) 首次进入默认静音（aria-pressed="false"）
+      await openMoreMenuIfNeeded(first);
       const firstSoundBtn = first.getByRole('button', { name: '开启音效' });
       await expect(firstSoundBtn).toBeVisible();
       await expect(firstSoundBtn).toHaveAttribute('aria-pressed', 'false');
 
       // 旁观者（second）打开音效，用于验证“即使开启了音效，别人投掷也绝不发声”
+      await openMoreMenuIfNeeded(second);
       await second.getByRole('button', { name: '开启音效' }).click();
       await expect(second.getByRole('button', { name: '关闭音效' })).toHaveAttribute('aria-pressed', 'true');
 
@@ -438,11 +457,13 @@ test.describe('骰子只跟随最新权威记录', () => {
       expect(secondOnFirstRoll.audioStarts, '别人投掷时旁观页不应播放音效').toBe(0);
 
       // 2) first 开启音效并刷新页面：刷新后记住开启状态，且整个加载期间 MutationObserver 确认无动画重播、无声音重播
+      await openMoreMenuIfNeeded(first);
       await first.getByRole('button', { name: '开启音效' }).click();
       await expect(first.getByRole('button', { name: '关闭音效' })).toHaveAttribute('aria-pressed', 'true');
 
       await first.reload();
       await expect(first.locator('.record')).toHaveCount(1, { timeout: 30_000 });
+      await openMoreMenuIfNeeded(first);
       await expect(first.getByRole('button', { name: '关闭音效' })).toHaveAttribute('aria-pressed', 'true');
       const firstAfterReload = await readProbe(first);
       expect(firstAfterReload.spinningEvents, '刷新页面加载期间不应重播历史动画').toBe(0);
@@ -502,6 +523,255 @@ test.describe('骰子只跟随最新权威记录', () => {
       await hostContext.close();
       await guestContext.close();
       await reducedContext.close();
+    }
+  });
+
+  test('粗粒度服务端时钟下快速投掷保留完整 0..6 阶段，真实迟到(>750ms)直接呈现停稳权威结果', async ({ browser }) => {
+    test.setTimeout(240_000);
+    const hostContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const guestContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+
+    await installAnimationAndAudioProbe(hostContext);
+    await installAnimationAndAudioProbe(guestContext);
+
+    let hostDelayedRoll = false;
+    let guestDelayedRoll = false;
+    let hostWsDelayMs = 0;
+    let guestWsDelayMs = 0;
+
+    // 在页面导航前为双方上下文安装 WebSocket 拦截，支持受控延迟权威推送（避免连接建立后才注册拦截失败）
+    await hostContext.routeWebSocket(/.*/, (ws) => {
+      const server = ws.connectToServer();
+      server.onMessage(async (message) => {
+        if (
+          hostDelayedRoll &&
+          typeof message === 'string' &&
+          message.includes('room:state') &&
+          message.includes('"reason":"rolled"')
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, hostWsDelayMs));
+        }
+        try {
+          ws.send(message);
+        } catch {
+          // 上下文已关闭
+        }
+      });
+      ws.onMessage((message) => {
+        try {
+          server.send(message);
+        } catch {
+          // 上下文已关闭
+        }
+      });
+    });
+
+    await guestContext.routeWebSocket(/.*/, (ws) => {
+      const server = ws.connectToServer();
+      server.onMessage(async (message) => {
+        if (
+          guestDelayedRoll &&
+          typeof message === 'string' &&
+          message.includes('room:state') &&
+          message.includes('"reason":"rolled"')
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, guestWsDelayMs));
+        }
+        try {
+          ws.send(message);
+        } catch {
+          // 上下文已关闭
+        }
+      });
+      ws.onMessage((message) => {
+        try {
+          server.send(message);
+        } catch {
+          // 上下文已关闭
+        }
+      });
+    });
+
+    const host = await hostContext.newPage();
+    const guest = await guestContext.newPage();
+
+    try {
+      await createRoom(host, { nickname: '阿月', roomName: '粗粒度与延迟回归', maxPlayers: 2, rounds: 5 });
+      const inviteUrl = await readInviteUrl(host);
+      await joinByInvite(guest, inviteUrl, '小满');
+      await toggleReady(guest);
+      await startGame(host);
+
+      const { roller: first, other: second } = await waitActiveRoller(host, guest);
+
+      // 场景 1：模拟秒级 HTTP Date 截断造成的粗粒度校时偏移（±500ms 误差窗口）
+      // 客户端发送动作后，响应带整秒截断的 Date 头，产生约 +480ms 的 serverNow 估计偏差。
+      // 在本地单调时钟约束下，在整秒边界后 ~25ms 快速触发投掷，正常快速返回的投掷必须完整保留 0..6 阶段，绝不跳过 1 或 2 阶段。
+      await first.route('**/api/rooms/*/actions', async (route) => {
+        const body = route.request().postDataJSON() as { type?: string } | null;
+        if (body?.type === 'roll') {
+          const response = await route.fetch();
+          const headers = response.headers();
+          // 整秒截断的 HTTP Date：模拟真实的整秒边界校时偏差
+          headers['date'] = new Date(Math.floor(Date.now() / 1000) * 1000).toUTCString();
+          await route.fulfill({ response, headers });
+          return;
+        }
+        await route.continue();
+      });
+
+      await resetProbe(first);
+      // 在整秒边界后约 25ms 快速触发投掷，暴露秒级 HTTP Date 截断校时场景（对标独立审查脚本）
+      await expect(first.getByRole('button', { name: '掷出好运' }).first()).toBeEnabled({ timeout: 30_000 });
+      await first.evaluate(
+        () =>
+          new Promise<void>((resolve) => {
+            const delay = 1000 - (Date.now() % 1000) + 25;
+            setTimeout(() => {
+              const btn = (document.querySelector('.action-inline .btn-roll') ??
+                document.querySelector('.btn-roll')) as HTMLButtonElement | null;
+              btn?.click();
+              resolve();
+            }, delay);
+          }),
+      );
+
+      await expect(first.locator('.record')).toHaveCount(1, { timeout: 30_000 });
+      await expect(second.locator('.record')).toHaveCount(1, { timeout: 30_000 });
+
+      const firstAuthority = await latestRecordDice(first);
+      expect(firstAuthority).toHaveLength(6);
+      await expect.poll(async () => await bowlPips(first), { timeout: 20_000 }).toEqual(firstAuthority);
+
+      const firstProbe = await readProbe(first);
+      expect(firstProbe.settledCounts, '粗粒度校时下快速投掷必须完整包含 0..6 停稳阶段').toEqual(
+        expect.arrayContaining([0, 1, 2, 3, 4, 5, 6]),
+      );
+      expect(firstProbe.phases, '必须完整经历所有运动阶段').toEqual(
+        expect.arrayContaining(['tumbling', 'landing', 'colliding', 'settling', 'idle']),
+      );
+
+      // 清理 first 的路由拦截，等待展示期自然结束进入后续回合
+      await first.unroute('**/api/rooms/*/actions');
+
+      // 场景 2：真实网络延迟超出展示窗口（>750ms）
+      // 覆盖两种权威传输到达顺序：
+      //   2a) HTTP 优先：HTTP 延迟 1350ms，WS 延迟 2500ms。HTTP 响应先到达并执行 syncClockFrom 校时；
+      //       验证 pre-request 采样 + 单调递增保护生效，避免延迟 HTTP 响应的往返不对称推低校时时钟导致错误回放 1..5。
+      //   2b) WS 优先：WS 延迟 1350ms，HTTP 延迟 2500ms。权威推送通过 WS 先到达；
+      //       验证在整秒+900ms 触发下，超过 750ms 窗口直接呈现停稳结果 6，不回放 1..5。
+      const lateScenarios = [
+        {
+          name: 'HTTP 优先 (HTTP 1350ms, WS 2500ms)',
+          httpDelayMs: 1350,
+          wsDelayMs: 2500,
+          expectedCount: 2,
+        },
+        {
+          name: 'WS 优先 (HTTP 2500ms, WS 1350ms)',
+          httpDelayMs: 2500,
+          wsDelayMs: 1350,
+          expectedCount: 3,
+        },
+      ];
+
+      for (const scenario of lateScenarios) {
+        const { roller, other } = await waitActiveRoller(host, guest);
+
+        if (roller === host) {
+          hostDelayedRoll = true;
+          hostWsDelayMs = scenario.wsDelayMs;
+        } else {
+          guestDelayedRoll = true;
+          guestWsDelayMs = scenario.wsDelayMs;
+        }
+
+        let rollRecordAt = 0;
+        let dateHeaderTime = 0;
+
+        await roller.route('**/api/rooms/*/actions', async (route) => {
+          const body = route.request().postDataJSON() as { type?: string } | null;
+          if (body?.type === 'roll') {
+            const response = await route.fetch();
+            const headers = response.headers();
+            if (headers['date']) {
+              dateHeaderTime = new Date(headers['date']).getTime();
+            }
+            try {
+              const data = (await response.json()) as { room?: { history?: Array<{ at: number }> } };
+              const history = data.room?.history ?? [];
+              if (history.length > 0) {
+                rollRecordAt = history[history.length - 1]!.at;
+              }
+            } catch {
+              // 忽略探测异常
+            }
+            await new Promise((resolve) => setTimeout(resolve, scenario.httpDelayMs));
+            await route.fulfill({ response });
+            return;
+          }
+          await route.continue();
+        });
+
+        await resetProbe(roller);
+        const rollStartTime = Date.now();
+
+        // 在整秒边界后约 900ms 触发投掷，模拟秒级 HTTP Date 截断与延迟响应的极端组合
+        await roller.evaluate(
+          () =>
+            new Promise<void>((resolve) => {
+              const delay = 1000 - (Date.now() % 1000) + 900;
+              setTimeout(() => {
+                const btn = (document.querySelector('.action-inline .btn-roll') ??
+                  document.querySelector('.btn-roll')) as HTMLButtonElement | null;
+                btn?.click();
+                resolve();
+              }, delay);
+            }),
+        );
+
+        await expect(roller.locator('.record')).toHaveCount(scenario.expectedCount, { timeout: 30_000 });
+        await expect(other.locator('.record')).toHaveCount(scenario.expectedCount, { timeout: 30_000 });
+        const pendingElapsed = Date.now() - rollStartTime;
+
+        const minDelay = Math.min(scenario.httpDelayMs, scenario.wsDelayMs);
+        expect(pendingElapsed, `${scenario.name} 实际等待交付时长必须超过 750ms 动画窗口`).toBeGreaterThanOrEqual(minDelay);
+        expect(rollRecordAt, '必须读取到权威投掷时间戳').toBeGreaterThan(0);
+        if (dateHeaderTime > 0) {
+          const dateHeaderUncertainty = Math.abs(rollRecordAt - dateHeaderTime);
+          expect(dateHeaderUncertainty).toBeLessThanOrEqual(2_000);
+        }
+
+        const authority = await latestRecordDice(roller);
+        expect(authority).toHaveLength(6);
+        await expect.poll(async () => await bowlPips(roller), { timeout: 20_000 }).toEqual(authority);
+
+        const delayedProbe = await readProbe(roller);
+        // 超出动画窗口时，收到权威快照后直接呈现停稳点数（6），中间停稳阶段 1..5 绝不应被回放
+        expect(delayedProbe.settledCounts, `${scenario.name} 超出动画窗口必须包含最终停稳阶段 6`).toContain(6);
+        for (const intermediate of [1, 2, 3, 4, 5]) {
+          expect(
+            delayedProbe.settledCounts,
+            `${scenario.name} 超出动画窗口迟到时不应回放任何中间停稳阶段 ${intermediate}`,
+          ).not.toContain(intermediate);
+        }
+        expect(await bowlPips(roller)).toEqual(authority);
+
+        // 等待较慢信道交付完成，防止上一轮的延迟消息干扰下一轮测试
+        const remainingDelay = Math.max(scenario.httpDelayMs, scenario.wsDelayMs) - (Date.now() - rollStartTime);
+        if (remainingDelay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, remainingDelay + 100));
+        }
+
+        await roller.unroute('**/api/rooms/*/actions');
+        hostDelayedRoll = false;
+        guestDelayedRoll = false;
+      }
+    } finally {
+      hostDelayedRoll = false;
+      guestDelayedRoll = false;
+      await hostContext.close();
+      await guestContext.close();
     }
   });
 });

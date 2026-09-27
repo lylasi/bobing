@@ -5,6 +5,7 @@ import { AppDatabase } from '../server/db.js';
 import { RoomService } from '../server/room-service.js';
 import { createDefaultRoomConfig } from '../shared/room-config.js';
 import { NORMAL_PRIZE_KEYS, PRIZE_KEYS, ROOM_TTL_MS } from '../shared/rules.js';
+import { DEFAULT_RESULT_HOLD_SECONDS } from '../shared/presentation.js';
 import type { Action, Membership, RoomConfig, RoomState } from '../shared/types.js';
 
 const NONE = [1, 1, 2, 2, 3, 3];
@@ -66,6 +67,12 @@ function startTable(config: RoomConfig, players: number) {
     room = service.action(code, member.token, action).room;
     last = { member, action };
     expect(room.revision).toBeGreaterThan(previousRevision);
+    // 投掷只开始展示：真正轮到下一位要走服务端 tick 读完展示，这里不绕过该阶段
+    if (room.presentation) {
+      clock.now = room.presentation.until ?? clock.now;
+      service.tick();
+      room = service.getSnapshot(code)!;
+    }
     for (const key of PRIZE_KEYS) {
       expect(room.pool[key]).toBeGreaterThanOrEqual(0);
       expect(room.pool[key] + room.players.reduce((sum, player) => sum + player.awards[key], 0))
@@ -155,10 +162,16 @@ it('最后一个机会因超时结束时，也从结算时刻开始保留 24 小
   config.endCondition = { mode: 'rounds', maxRounds: 5 };
   const table = startTable(config, 2);
   for (let i = 0; i < 10; i += 1) {
-    const before = table.service.getSnapshot(table.code)!;
+    let before = table.service.getSnapshot(table.code)!;
     expect(before.status).toBe('playing');
     table.clock.now = before.deadline!;
-    table.service.tick();
+    table.service.tick(); // 到点：记一次超时并开始结果展示
+    before = table.service.getSnapshot(table.code)!;
+    expect(before.presentation).not.toBeNull();
+    // 超时没有动画：展示时长就是配置的停留时长（默认 1 秒）
+    expect(before.presentation?.until).toBe(table.clock.now + DEFAULT_RESULT_HOLD_SECONDS * 1000);
+    table.clock.now = before.presentation!.until!;
+    table.service.tick(); // 读完展示才轮到下一位（第 10 次在这里结算）
   }
   const finished = table.service.getSnapshot(table.code)!;
   expect(finished.status).toBe('finished');
@@ -209,7 +222,11 @@ it('旧房间的提前收尾标记在没有状元时不能造成“奖品发完�
   // 使用实际完成 62 次发奖后的完整存储快照，转换为真实的旧字段集合。
   const stored = table.db.getRoom(table.code)!;
   const legacy = JSON.parse(stored.stateJson) as Record<string, unknown>;
-  for (const key of ['config', 'ruleset', 'initialPool', 'closingRound', 'incomplete', 'allOfflineSince']) {
+  for (const key of [
+    'config', 'ruleset', 'initialPool', 'closingRound', 'incomplete', 'allOfflineSince',
+    // 新字段一并去掉：这份快照要成为真正的旧数据，验证迁移默认值而不是保留新字段
+    'pacing', 'access', 'presentation', 'presentationRemainingMs', 'championEvents', 'championHistoryComplete',
+  ]) {
     delete legacy[key];
   }
   legacy.maxRounds = 20;
@@ -218,6 +235,7 @@ it('旧房间的提前收尾标记在没有状元时不能造成“奖品发完�
   for (const player of legacy.players as Array<Record<string, unknown>>) {
     delete player.rollCount;
     delete player.timeoutCount;
+    delete player.lastRoll;
   }
   table.db.saveRoom({
     ...stored,
@@ -234,7 +252,15 @@ it('旧房间的提前收尾标记在没有状元时不能造成“奖品发完�
     restored = restoredService.action(table.code, member.token, {
       type: 'roll', requestId: randomUUID(), expectedTurnId: restored.turnId!,
     }).room;
+    table.clock.now = restored.presentation?.until ?? table.clock.now;
+    restoredService.tick();
+    restored = restoredService.state(table.code, member.token).room;
   }
+  // 旧房间迁移后不伪造状元历程，也不自动放开可见性
+  expect(restored.championEvents).toEqual([]);
+  expect(restored.championHistoryComplete).toBe(false);
+  expect(restored.pacing).toEqual({ resultHoldSeconds: DEFAULT_RESULT_HOLD_SECONDS });
+  expect(restored.access).toEqual({ visibility: 'invite', allowSpectators: false });
   expect(restored.status).toBe('playing');
   expect(restored.finishedReason).toBeNull();
   expect(restored.pool.zhuangyuan).toBe(1);

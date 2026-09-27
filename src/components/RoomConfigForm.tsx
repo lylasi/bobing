@@ -2,8 +2,9 @@
  * 房间配置编辑器（首页创建与等待室房主编辑共用）。
  *
  * - 不嵌套独立 <form>，避免与外层表单冲突。
- * - 包含系统房规、结束方式、固定轮数选择、六档奖品数量与可选内容、默认数量恢复、本机个人方案管理。
- * - 应用个人方案或恢复默认数量时，严格保留当前选择的系统房规（rulesetId）。
+ * - 包含系统房规、结束方式、固定轮数选择、单层六行奖品表（桌面奖级/数量/内容三列、手机每档两行）、
+ *   默认数量恢复，以及独立收起的本机个人方案管理。
+ * - 应用个人方案或恢复默认数量时，严格保留当前选择的系统房规（rulesetId），也不触碰房间访问/节奏设置。
  */
 
 import { useEffect, useId, useRef, useState } from 'react';
@@ -14,6 +15,7 @@ import type { PrizeKey, RoomConfig, RulesetId } from '../../shared/types.js';
 import { totalConfiguredPrizes } from '../lib/format.js';
 import { deleteTemplate, loadTemplates, upsertTemplate } from '../lib/templates.js';
 import type { PersonalTemplate } from '../lib/templates.js';
+import '../styles-room-settings.css';
 
 export interface RoomConfigFormProps {
   value: RoomConfig;
@@ -70,7 +72,12 @@ export function RoomConfigForm({
   const baseId = useId();
   const advancedToggleId = `${baseId}-advanced-toggle`;
   const advancedPanelId = `${baseId}-advanced-panel`;
+  const templatesToggleId = `${baseId}-templates-toggle`;
+  const templatesPanelId = `${baseId}-templates-panel`;
+
   const [advancedOpen, setAdvancedOpen] = useState<boolean>(defaultAdvancedOpen);
+  /** 个人方案管理独立收起，减少嵌套卡片与视觉负担 */
+  const [templatesOpen, setTemplatesOpen] = useState<boolean>(false);
   const [rawCounts, setRawCounts] = useState<Record<PrizeKey, string>>(() => {
     const counts = numericCountsFromConfig(value);
     const initial = {} as Record<PrizeKey, string>;
@@ -486,13 +493,13 @@ export function RoomConfigForm({
           className="config-advanced-panel"
           hidden={!advancedOpen}
         >
-          {/* 3a. 六档奖品配置 */}
-          <fieldset className="form-field config-fieldset" disabled={disabled}>
+          {/* 3a. 单层六行奖品表（桌面：奖级/数量/内容三列；手机：每档两行） */}
+          <fieldset className="config-prizes-section" disabled={disabled}>
             <div className="config-section-bar">
               <div>
                 <span className="field-label">六档奖品配置</span>
                 <p className="field-hint">
-                  当前共 <strong>{totalPrizes}</strong> 份奖品（状元份数归唯一最终状元得主所有；内容留空则不显示说明）。
+                  当前共 <strong>{totalPrizes}</strong> 份奖品（状元份数全部归最终状元得主所有；内容留空则不显示说明）。
                 </p>
               </div>
               <button
@@ -505,48 +512,66 @@ export function RoomConfigForm({
               </button>
             </div>
 
-            <div className="config-prizes-list">
+            <div className="config-prizes-head-row" aria-hidden="true">
+              <span>奖级（牌型）</span>
+              <span>数量（份）</span>
+              <span>奖品内容（可选）</span>
+            </div>
+
+            <div className="config-prizes-list" role="list" aria-label="六档奖品配置列表">
               {PRIZE_KEYS.map((key) => {
                 const meta = PRIZE_META[key];
                 const countId = `${baseId}-count-${key}`;
                 const contentId = `${baseId}-content-${key}`;
+                const isChampion = key === 'zhuangyuan';
                 return (
-                  <div key={key} className="config-prize-item">
+                  <div
+                    key={key}
+                    role="listitem"
+                    className={`config-prize-item ${isChampion ? 'config-prize-item--champion' : ''}`}
+                  >
                     <div className="config-prize-header">
-                      <span className="config-prize-name">{meta.label}</span>
+                      <div className="config-prize-title-line">
+                        <span className="config-prize-name">{meta.label}</span>
+                        {isChampion ? (
+                          <span className="config-prize-badge">全部归最终状元</span>
+                        ) : null}
+                      </div>
                       <span className="config-prize-desc">{meta.description}</span>
                     </div>
-                    <div className="config-prize-inputs">
-                      <div className="config-prize-count-wrap">
-                        <label className="field-label" htmlFor={countId}>
-                          {meta.label}数量
-                        </label>
-                        <input
-                          id={countId}
-                          type="number"
-                          min={1}
-                          step={1}
-                          className="input config-count-input"
-                          value={rawCounts[key]}
-                          onChange={(event) => handleCountChange(key, event.target.value)}
-                          disabled={disabled}
-                        />
-                      </div>
-                      <div className="config-prize-content-wrap">
-                        <label className="field-label" htmlFor={contentId}>
-                          {meta.label}奖品内容
-                        </label>
-                        <input
-                          id={contentId}
-                          type="text"
-                          maxLength={40}
-                          className="input"
-                          placeholder="可选，例如：月饼一盒"
-                          value={value.prizes[key].content}
-                          onChange={(event) => handleContentChange(key, event.target.value)}
-                          disabled={disabled}
-                        />
-                      </div>
+
+                    <div className="config-prize-count-wrap">
+                      <label className="field-label config-inline-label" htmlFor={countId}>
+                        <span className="visually-hidden">{meta.label}</span>数量
+                      </label>
+                      <input
+                        id={countId}
+                        aria-label={`${meta.label}数量`}
+                        type="number"
+                        min={1}
+                        step={1}
+                        className="input config-count-input"
+                        value={rawCounts[key]}
+                        onChange={(event) => handleCountChange(key, event.target.value)}
+                        disabled={disabled}
+                      />
+                    </div>
+
+                    <div className="config-prize-content-wrap">
+                      <label className="field-label config-inline-label" htmlFor={contentId}>
+                        <span className="visually-hidden">{meta.label}</span>奖品内容
+                      </label>
+                      <input
+                        id={contentId}
+                        aria-label={`${meta.label}奖品内容`}
+                        type="text"
+                        maxLength={40}
+                        className="input config-content-input"
+                        placeholder="可选，例如：月饼一盒"
+                        value={value.prizes[key].content}
+                        onChange={(event) => handleContentChange(key, event.target.value)}
+                        disabled={disabled}
+                      />
                     </div>
                   </div>
                 );
@@ -554,100 +579,127 @@ export function RoomConfigForm({
             </div>
           </fieldset>
 
-          {/* 3b. 个人方案（本机存储） */}
-          <fieldset className="form-field config-fieldset config-templates-box" disabled={disabled}>
-            <legend className="field-label">个人方案（仅保存在本浏览器）</legend>
-            <p className="field-hint">
-              只保存六档数量、内容与结束方式，不改变已选系统房规；清除浏览器数据后不可恢复。
-            </p>
+          {/* 3b. 独立收起的个人方案管理（本机存储） */}
+          <div className="config-templates-collapsible">
+            <div className="config-templates-bar">
+              <div className="config-templates-bar-info">
+                <span className="field-label">个人方案（本浏览器保存）</span>
+                <p className="field-hint">
+                  只保存六档数量、内容与结束方式，不改变系统房规与房间公开/停留设置。
+                </p>
+              </div>
+              <button
+                type="button"
+                id={templatesToggleId}
+                className={`btn btn-secondary btn-small config-disclosure-btn config-template-toggle-btn ${templatesOpen ? 'is-expanded' : ''}`}
+                aria-expanded={templatesOpen}
+                aria-controls={templatesPanelId}
+                onClick={() => setTemplatesOpen((prev) => !prev)}
+                disabled={disabled}
+              >
+                <span>个人方案管理</span>
+                <span className="config-disclosure-state" aria-hidden="true">
+                  {templatesOpen ? '收起 ▲' : '展开 ▼'}
+                </span>
+              </button>
+            </div>
 
-            <div className="config-template-row">
-              <div className="form-field">
-                <label className="field-label" htmlFor={`${baseId}-tpl-select`}>
-                  已存个人方案
-                </label>
-                <div className="config-template-select-group">
-                  <select
-                    id={`${baseId}-tpl-select`}
-                    className="input"
-                    aria-label="已存个人方案"
-                    value={selectedTemplateId}
-                    onChange={(event) => handleSelectTemplate(event.target.value)}
-                    disabled={disabled || templates.length === 0}
-                  >
-                    <option value="">
-                      {templates.length === 0 ? '暂无已保存方案' : '请选择个人方案…'}
-                    </option>
-                    {templates.map((item) => (
-                      <option key={item.id} value={item.id}>
-                        {item.name}
+            <fieldset
+              id={templatesPanelId}
+              role="region"
+              aria-labelledby={templatesToggleId}
+              className="config-templates-panel"
+              disabled={disabled}
+              hidden={!templatesOpen}
+            >
+              <div className="config-template-row">
+                <div className="form-field">
+                  <label className="field-label" htmlFor={`${baseId}-tpl-select`}>
+                    已存个人方案
+                  </label>
+                  <div className="config-template-select-group">
+                    <select
+                      id={`${baseId}-tpl-select`}
+                      className="input"
+                      aria-label="已存个人方案"
+                      value={selectedTemplateId}
+                      onChange={(event) => handleSelectTemplate(event.target.value)}
+                      disabled={disabled || templates.length === 0}
+                    >
+                      <option value="">
+                        {templates.length === 0 ? '暂无已保存方案' : '请选择个人方案…'}
                       </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-small"
-                    onClick={handleLoadSelectedTemplate}
-                    disabled={disabled || templates.length === 0}
-                  >
-                    载入方案
-                  </button>
+                      {templates.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-small"
+                      onClick={handleLoadSelectedTemplate}
+                      disabled={disabled || templates.length === 0}
+                    >
+                      载入方案
+                    </button>
+                  </div>
+                </div>
+
+                <div className="form-field">
+                  <label className="field-label" htmlFor={`${baseId}-tpl-name`}>
+                    个人方案名称
+                  </label>
+                  <input
+                    id={`${baseId}-tpl-name`}
+                    type="text"
+                    maxLength={24}
+                    className="input"
+                    placeholder="例如：中秋家宴方案"
+                    value={templateName}
+                    onChange={(event) => setTemplateName(event.target.value)}
+                    disabled={disabled}
+                  />
                 </div>
               </div>
 
-              <div className="form-field">
-                <label className="field-label" htmlFor={`${baseId}-tpl-name`}>
-                  个人方案名称
-                </label>
-                <input
-                  id={`${baseId}-tpl-name`}
-                  type="text"
-                  maxLength={24}
-                  className="input"
-                  placeholder="例如：中秋家宴方案"
-                  value={templateName}
-                  onChange={(event) => setTemplateName(event.target.value)}
+              <div className="config-template-actions">
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-small"
+                  onClick={handleSaveNewTemplate}
                   disabled={disabled}
-                />
+                >
+                  保存方案
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-small"
+                  onClick={handleUpdateTemplate}
+                  disabled={disabled || !selectedTemplateId}
+                >
+                  更新方案
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-small"
+                  onClick={handleDeleteTemplate}
+                  disabled={disabled || !selectedTemplateId}
+                >
+                  删除方案
+                </button>
               </div>
-            </div>
 
-            <div className="config-template-actions">
-              <button
-                type="button"
-                className="btn btn-secondary btn-small"
-                onClick={handleSaveNewTemplate}
-                disabled={disabled}
-              >
-                保存方案
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary btn-small"
-                onClick={handleUpdateTemplate}
-                disabled={disabled || !selectedTemplateId}
-              >
-                更新方案
-              </button>
-              <button
-                type="button"
-                className="btn btn-ghost btn-small"
-                onClick={handleDeleteTemplate}
-                disabled={disabled || !selectedTemplateId}
-              >
-                删除方案
-              </button>
-            </div>
-
-            {templateFeedback ? (
-              <p
-                className={templateFeedback.tone === 'error' ? 'form-error' : 'config-template-ok'}
-                role={templateFeedback.tone === 'error' ? 'alert' : 'status'}
-              >
-                {templateFeedback.text}
-              </p>
-            ) : null}
-          </fieldset>
+              {templateFeedback ? (
+                <p
+                  className={templateFeedback.tone === 'error' ? 'form-error' : 'config-template-ok'}
+                  role={templateFeedback.tone === 'error' ? 'alert' : 'status'}
+                >
+                  {templateFeedback.text}
+                </p>
+              ) : null}
+            </fieldset>
+          </div>
         </div>
       </div>
     </div>

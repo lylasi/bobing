@@ -13,6 +13,7 @@ import {
   isFinished,
   joinByInvite,
   latestDiceLabel,
+  openMoreMenuIfNeeded,
   playUntilFinished,
   prizeSnapshot,
   readInviteUrl,
@@ -113,6 +114,9 @@ test.describe('两人真实对局', () => {
     const host = await hostContext.newPage();
     const guest = await guestContext.newPage();
     const third = await thirdContext.newPage();
+    const hostConsole = watchConsole(host);
+    const guestConsole = watchConsole(guest);
+    const thirdConsole = watchConsole(third);
     try {
       const code = await createRoom(host, { nickname: '阿月', roomName: '两人小桌', maxPlayers: 2, rounds: 5 });
       const inviteUrl = await readInviteUrl(host);
@@ -122,6 +126,9 @@ test.describe('两人真实对局', () => {
       await expect(third.getByRole('button', { name: '加入房间' })).toHaveCount(0);
       await expect(third.getByRole('link', { name: '回首页' })).toBeVisible();
       expect(code).toHaveLength(6);
+      expect(hostConsole.errors).toEqual([]);
+      expect(guestConsole.errors).toEqual([]);
+      expect(thirdConsole.errors).toEqual([]);
     } finally {
       await hostContext.close();
       await guestContext.close();
@@ -134,6 +141,8 @@ test.describe('两人真实对局', () => {
     const guestContext = await browser.newContext();
     const host = await hostContext.newPage();
     const guest = await guestContext.newPage();
+    const hostConsole = watchConsole(host);
+    const guestConsole = watchConsole(guest);
     try {
       await createRoom(host, { nickname: '阿月', roomName: '开局后不加人', maxPlayers: 4, rounds: 5 });
       const inviteUrl = await readInviteUrl(host);
@@ -141,16 +150,26 @@ test.describe('两人真实对局', () => {
       await toggleReady(guest);
       await startGame(host);
 
+      await openMoreMenuIfNeeded(host);
       await host.getByRole('button', { name: '邀请亲友' }).first().click();
       await expect(host.getByRole('dialog', { name: '邀请亲友' })).toBeVisible();
       const url = await host.getByLabel('邀请链接，可选中复制').inputValue();
       await host.keyboard.press('Escape');
 
-      const late = await (await browser.newContext()).newPage();
-      await late.goto(url);
-      await expect(late.getByText('本局已经开始，暂时不能加入')).toBeVisible();
-      await expect(late.getByRole('button', { name: '加入房间' })).toHaveCount(0);
-      await late.context().close();
+      const lateContext = await browser.newContext();
+      const late = await lateContext.newPage();
+      const lateConsole = watchConsole(late);
+      try {
+        await late.goto(url);
+        await expect(late.getByText('本局已经开始，暂时不能加入')).toBeVisible();
+        await expect(late.getByRole('button', { name: '加入房间' })).toHaveCount(0);
+        expect(lateConsole.errors).toEqual([]);
+      } finally {
+        await lateContext.close();
+      }
+
+      expect(hostConsole.errors).toEqual([]);
+      expect(guestConsole.errors).toEqual([]);
     } finally {
       await hostContext.close();
       await guestContext.close();
@@ -171,6 +190,8 @@ test.describe('两人真实对局', () => {
     const guestContext = await browser.newContext();
     const host = await hostContext.newPage();
     const guest = await guestContext.newPage();
+    const hostConsole = watchConsole(host);
+    const guestConsole = watchConsole(guest);
     try {
       await createRoom(host, { nickname: '阿月', roomName: '提前收桌', maxPlayers: 2, rounds: 20 });
       const inviteUrl = await readInviteUrl(host);
@@ -178,17 +199,22 @@ test.describe('两人真实对局', () => {
       await toggleReady(guest);
       await startGame(host);
 
+      await openMoreMenuIfNeeded(host);
       await host.getByRole('button', { name: '提前结束' }).click();
       const confirm = host.getByRole('dialog', { name: '提前结束本局？' });
       await expect(confirm).toBeVisible();
       await confirm.getByRole('button', { name: '继续博饼' }).click();
       await expect(host.getByRole('button', { name: '掷出好运' }).first()).toBeVisible();
 
+      await openMoreMenuIfNeeded(host);
       await host.getByRole('button', { name: '提前结束' }).click();
       await host.getByRole('dialog', { name: '提前结束本局？' }).getByRole('button', { name: '确认结束' }).click();
       await expect(host.getByText('房主提前结束')).toBeVisible({ timeout: 20_000 });
       await expect(guest.getByText('房主提前结束')).toBeVisible({ timeout: 20_000 });
       expect(await isFinished(host)).toBe(true);
+
+      expect(hostConsole.errors).toEqual([]);
+      expect(guestConsole.errors).toEqual([]);
     } finally {
       await hostContext.close();
       await guestContext.close();

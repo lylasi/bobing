@@ -9,8 +9,10 @@ import type { RoomState } from '../../shared/types.js';
 import {
   championLockedByLabel,
   championPlayer,
+  describeRoll,
   endConditionLabel,
   finishedReasonLabel,
+  latestRoll,
   playerRollCount,
   playerTimeoutCount,
   standings,
@@ -19,8 +21,10 @@ import {
   totalRoomRolls,
   totalRoomTimeouts,
 } from '../lib/format.js';
+import { ChampionHistory } from './ChampionHistory.js';
 import { DiceRow } from './Dice.js';
 import { History } from './History.js';
+import { MyRewards } from './MyRewards.js';
 
 export interface ResultsProps {
   room: RoomState;
@@ -40,6 +44,9 @@ export function Results({ room, playerId, isHost, busy, onRematch, onLeaveReques
   const totalRolls = totalRoomRolls(room);
   const totalTimeouts = totalRoomTimeouts(room);
   const lockedLabel = championLockedByLabel(room);
+  const finalRoll = latestRoll(room);
+  const finalHeadline = finalRoll ? describeRoll(finalRoll, room) : null;
+  const zhuangyuanContent = room.config.prizes.zhuangyuan?.content?.trim() ?? '';
 
   return (
     <div className="results">
@@ -62,13 +69,29 @@ export function Results({ room, playerId, isHost, busy, onRematch, onLeaveReques
             <p className="result-champion-label">
               {room.champion.result.label}
               {lockedLabel ? ` · 高阶锁定（${lockedLabel}）` : ''}
-              {leader.awards.zhuangyuan > 0 ? ` · 获得状元 ${leader.awards.zhuangyuan} 份` : ''}
+              {leader.awards.zhuangyuan > 0
+                ? ` · 获得状元 ${leader.awards.zhuangyuan} 份${zhuangyuanContent ? `（${zhuangyuanContent}）` : ''}`
+                : ''}
             </p>
           </>
         ) : (
           <p className="result-champion-name result-champion-name--none">本局状元空缺 · 好运留待下次</p>
         )}
+        {finalRoll && finalHeadline ? (
+          <p className="result-final-roll-note">
+            收官一掷：{finalRoll.nickname} · {finalHeadline.title}
+          </p>
+        ) : null}
       </section>
+
+      <div className="result-experience-grid">
+        <div className="card">
+          <MyRewards room={room} playerId={playerId} variant="panel" />
+        </div>
+        <div className="card">
+          <ChampionHistory room={room} playerId={playerId} variant="panel" />
+        </div>
+      </div>
 
       <section className="result-summary">
         <h2 className="section-title">本局小结</h2>

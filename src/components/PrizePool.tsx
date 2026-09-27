@@ -77,7 +77,7 @@ export function PrizePool({ room }: { room: RoomState }): ReactElement {
         )}
       </div>
 
-      <ul className="prize-rows">
+      <ul className="prize-rows" aria-label="六档奖品余量列表" tabIndex={0}>
         {NORMAL_PRIZE_KEYS.map((key) => renderPrizeRow(room, key, false))}
         {renderPrizeRow(room, 'zhuangyuan', true)}
       </ul>

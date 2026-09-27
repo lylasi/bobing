@@ -8,29 +8,32 @@
 
 import { createElement, useCallback, useEffect, useState } from 'react';
 import type { AnchorHTMLAttributes, MouseEvent, ReactNode } from 'react';
-import { ROOM_CODE_ALPHABET, ROOM_CODE_LENGTH } from '../../shared/rules.js';
+import { isAcceptedRoomCode, normalizeRoomCodeText } from '../../shared/room-code.js';
+
+export { normalizeRoomCodeText };
 
 export type Route =
   | { name: 'home' }
+  | { name: 'lobby' }
   | { name: 'rules' }
+  | { name: 'spectate'; code: string }
   | { name: 'room'; code: string }
   | { name: 'notFound'; path: string };
 
-/** 房码字符集与 shared/rules.ts 一致（去掉易混字符），长度 6。 */
+/** 接受六位数字码或旧字符集六位码，自动去除空格并转大写。 */
 export function isValidRoomCode(code: string): boolean {
-  if (code.length !== ROOM_CODE_LENGTH) return false;
-  for (const char of code) {
-    if (!ROOM_CODE_ALPHABET.includes(char)) return false;
-  }
-  return true;
+  return isAcceptedRoomCode(normalizeRoomCodeText(code));
 }
 
 export function parsePath(pathname: string): Route {
   const path = pathname.replace(/\/+$/, '') || '/';
   if (path === '/') return { name: 'home' };
+  if (path === '/lobby') return { name: 'lobby' };
   if (path === '/rules') return { name: 'rules' };
+  const watch = /^\/room\/([^/]+)\/watch$/.exec(path);
+  if (watch) return { name: 'spectate', code: normalizeRoomCodeText(decodeURIComponent(watch[1] ?? '')) };
   const room = /^\/room\/([^/]+)$/.exec(path);
-  if (room) return { name: 'room', code: decodeURIComponent(room[1] ?? '').trim().toUpperCase() };
+  if (room) return { name: 'room', code: normalizeRoomCodeText(decodeURIComponent(room[1] ?? '')) };
   return { name: 'notFound', path };
 }
 

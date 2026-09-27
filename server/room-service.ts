@@ -22,7 +22,6 @@ import {
   MAX_PLAYERS,
   MIN_PLAYERS,
   NICKNAME_MAX_LENGTH,
-  ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
   ROOM_NAME_MAX_LENGTH,
   ROOM_TTL_MS,
@@ -30,17 +29,28 @@ import {
   TURN_DURATION_MS,
 } from '../shared/rules.js';
 import { createDefaultRoomConfig, normalizeRoomConfig, poolFromConfig } from '../shared/room-config.js';
+import { createDefaultRoomAccess, normalizeRoomAccess, sameRoomAccess } from '../shared/room-access.js';
+import { normalizeRoomPacing, sameRoomPacing } from '../shared/presentation.js';
+import { ROOM_CODE_DIGITS, isAcceptedRoomCode, normalizeRoomCodeText } from '../shared/room-code.js';
 import { snapshotRuleset } from '../shared/rulesets.js';
 import { ERROR_HTTP_STATUS, ERROR_MESSAGES } from '../shared/types.js';
 import type {
   Action,
   Champion,
+  ChampionEvent,
+  ChampionOutcome,
   DiceResult,
   ErrorCode,
   FinishedReason,
+  LobbyPage,
+  LobbyQuery,
+  LobbyRoomSummary,
   Membership,
   Player,
+  ResultPresentation,
+  RoomAccess,
   RoomConfig,
+  RoomPacing,
   RoomPreview,
   RoomState,
   RollRecord,
@@ -50,6 +60,7 @@ import {
   activePlayers,
   allActiveOffline,
   applyRoll,
+  completeResultPresentation,
   countActive,
   createInternalRoom,
   dropCurrentTurnIfPlayer,
@@ -110,6 +121,10 @@ export interface CreateRoomInput {
   config?: unknown;
   /** 旧客户端遗留的固定轮数；与 config 同时出现时拒绝。 */
   maxRounds?: unknown;
+  /** 可选房间节奏；省略时使用新房默认（结果停留 1 秒）。 */
+  pacing?: unknown;
+  /** 可选访问设置；省略时使用新房默认（公开、允许旁观）。 */
+  access?: unknown;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -149,6 +164,32 @@ function cloneResult(result: DiceResult): DiceResult {
   };
 }
 
+function cloneChampionOutcome(outcome: ChampionOutcome | null): ChampionOutcome | null {
+  return outcome ? { ...outcome } : null;
+}
+
+function cloneChampionEvent(event: ChampionEvent): ChampionEvent {
+  return {
+    id: event.id,
+    recordId: event.recordId,
+    kind: event.kind,
+    playerId: event.playerId,
+    nickname: event.nickname,
+    previousPlayerId: event.previousPlayerId,
+    previousNickname: event.previousNickname,
+    round: event.round,
+    at: event.at,
+    dice: [...event.dice],
+    result: cloneResult(event.result),
+    locked: event.locked,
+    awardedCount: event.awardedCount,
+  };
+}
+
+function clonePresentation(presentation: ResultPresentation | null): ResultPresentation | null {
+  return presentation ? { recordId: presentation.recordId, until: presentation.until } : null;
+}
+
 function cloneRollRecord(record: RollRecord): RollRecord {
   return {
     id: record.id,
@@ -161,6 +202,7 @@ function cloneRollRecord(record: RollRecord): RollRecord {
     awarded: record.awarded,
     reason: record.reason,
     at: record.at,
+    championOutcome: cloneChampionOutcome(record.championOutcome),
   };
 }
 
@@ -176,6 +218,7 @@ function toPublicPlayer(player: InternalPlayer): Player {
     best: player.best ? cloneResult(player.best) : null,
     rollCount: player.rollCount,
     timeoutCount: player.timeoutCount,
+    lastRoll: player.lastRoll ? cloneRollRecord(player.lastRoll) : null,
   };
 }
 
@@ -199,6 +242,8 @@ export function toPublicRoom(room: InternalRoom): RoomState {
     name: room.name,
     maxPlayers: room.maxPlayers,
     config: structuredClone(room.config),
+    pacing: { ...room.pacing },
+    access: { ...room.access },
     ruleset: structuredClone(room.ruleset),
     rulesVersion: room.rulesVersion,
     status: room.status,
@@ -214,6 +259,9 @@ export function toPublicRoom(room: InternalRoom): RoomState {
     pool: { ...room.pool },
     initialPool: { ...room.initialPool },
     champion,
+    championEvents: room.championEvents.map(cloneChampionEvent),
+    championHistoryComplete: room.championHistoryComplete,
+    presentation: clonePresentation(room.presentation),
     closingRound: room.closingRound,
     incomplete: room.incomplete,
     allOfflineSince: room.allOfflineSince,
@@ -274,9 +322,10 @@ export class RoomService {
     this.createRoomCodeFn =
       options.createRoomCode ??
       (() => {
+        // 新房码为六位纯数字，保留前导零：用字符串拼接，绝不经过 number
         let code = '';
         for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
-          code += ROOM_CODE_ALPHABET[randomInt(0, ROOM_CODE_ALPHABET.length)];
+          code += ROOM_CODE_DIGITS[randomInt(0, ROOM_CODE_DIGITS.length)];
         }
         return code;
       });
@@ -385,6 +434,9 @@ export class RoomService {
         turnId: null,
         paused: false,
         pauseRemainingMs: null,
+        // 已关闭的房间里不能留下没有意义的展示阶段
+        presentation: null,
+        presentationRemainingMs: null,
       };
       return {
         code: room.code,
@@ -493,6 +545,24 @@ export class RoomService {
   private normalizeConfigOrInvalid(value: unknown): RoomConfig {
     try {
       return normalizeRoomConfig(value);
+    } catch {
+      throw new ServiceError('INVALID_INPUT');
+    }
+  }
+
+  /** 结果停留配置：省略取默认，显式非法映射 INVALID_INPUT（两者必须区分）。 */
+  private normalizePacingOrInvalid(value: unknown): RoomPacing {
+    try {
+      return normalizeRoomPacing(value);
+    } catch {
+      throw new ServiceError('INVALID_INPUT');
+    }
+  }
+
+  /** 访问设置：非法显式值映射 INVALID_INPUT，不做静默补齐。 */
+  private normalizeAccessOrInvalid(value: unknown): RoomAccess {
+    try {
+      return normalizeRoomAccess(value);
     } catch {
       throw new ServiceError('INVALID_INPUT');
     }
@@ -665,15 +735,22 @@ export class RoomService {
 
     let changed = false;
     if (room.status === 'playing') {
-      if (!room.paused && room.deadline !== null && now >= room.deadline) {
-        if (skipExpiredTurn(room, now)) changed = true;
+      if (!room.paused) {
+        // 先结束到时的结果展示（0 秒停留允许同一 tick 内立即推进），再判回合超时
+        if (this.drainResultPresentation(room, now)) changed = true;
+        if (room.status === 'playing' && room.deadline !== null && now >= room.deadline) {
+          if (skipExpiredTurn(room, now)) changed = true;
+          // 超时也没有动画，只停留配置的阅读时间；0 秒时可立即完成
+          if (this.drainResultPresentation(room, now)) changed = true;
+        }
       }
       if (room.status !== 'playing') {
-        // 最后一次机会因超时把本局结算完：从结算时刻起重新计算 24 小时
+        // 最后一次机会因超时或结果展示结束把本局结算完：从结算时刻起重新计算 24 小时
         room.expiresAt = now + this.roomTtlMs;
         changed = true;
       } else {
         const active = activePlayers(room);
+        // 参赛者是否在线只看成员：观众在线不参与暂停判断，也不阻止离线到期
         const someoneOnline = active.some((player) => player.online);
         if (active.length === 0) {
           // 全员主动离席：未完成关闭，记录保留
@@ -716,6 +793,25 @@ export class RoomService {
     return changed;
   }
 
+  /**
+   * 结束所有已到时的结果展示（0 秒停留允许同一 tick 内连续推进）。
+   * 暂停（全员离线）、非 playing、展示未到时都不推进；最后一手在展示结束后照常结算。
+   */
+  private drainResultPresentation(room: InternalRoom, now: number): boolean {
+    let changed = false;
+    while (
+      room.status === 'playing' &&
+      !room.paused &&
+      room.presentation !== null &&
+      room.presentation.until !== null &&
+      now >= room.presentation.until
+    ) {
+      if (!completeResultPresentation(room, now)) break;
+      changed = true;
+    }
+    return changed;
+  }
+
   // —— 公共 API ——
 
   health(): boolean {
@@ -731,12 +827,25 @@ export class RoomService {
       playerCount,
       maxPlayers: room.maxPlayers,
       config: structuredClone(room.config),
+      pacing: { ...room.pacing },
+      access: { ...room.access },
       ruleset: structuredClone(room.ruleset),
       status: room.status,
       rulesVersion: room.rulesVersion,
       canJoin: room.status === 'waiting' && playerCount < room.maxPlayers,
       expiresAt: room.expiresAt,
     };
+  }
+
+  /**
+   * 只读旁观入口：允许旁观且房间有效（非 closed）才返回公开快照。
+   * 不需要成员 token，不标记任何成员在线，不刷新 lastActivityAt，也不延长到期时间。
+   */
+  watch(rawCode: string): RoomState {
+    const room = this.requireRoom(normalizeRoomCode(rawCode));
+    if (!room.access.allowSpectators) throw new ServiceError('SPECTATING_DISABLED');
+    if (room.status === 'closed') throw new ServiceError('INVALID_STATE', '房间已关闭');
+    return this.snapshot(room);
   }
 
   /** 创建房间的配置来源：新客户端 config，旧客户端 maxRounds 显式映射，两者同时出现拒绝。 */
@@ -767,6 +876,9 @@ export class RoomService {
       throw new ServiceError('INVALID_INPUT');
     }
     const config = this.resolveCreateConfig(input);
+    // 省略取默认（公开＋允许旁观）；显式给出但非法则拒绝，不做静默补齐
+    const pacing = this.normalizePacingOrInvalid(input.pacing);
+    const access = input.access === undefined ? createDefaultRoomAccess() : this.normalizeAccessOrInvalid(input.access);
     const now = this.nowFn();
     this.checkRateLimit(`create:${clientIp}`, this.limits.createJoinPerMinute, now);
 
@@ -778,6 +890,8 @@ export class RoomService {
       name,
       maxPlayers,
       config,
+      pacing,
+      access,
       hostId: playerId,
       hostNickname: nickname,
       hostTokenHash: hashToken(token),
@@ -818,6 +932,7 @@ export class RoomService {
       best: null,
       rollCount: 0,
       timeoutCount: 0,
+      lastRoll: null,
       tokenHash: hashToken(token),
       lastSeenAt: now,
     });
@@ -867,6 +982,10 @@ export class RoomService {
         return this.handleRematch(room, player, now);
       case 'update-config':
         return this.handleUpdateConfig(room, player, action.config, now);
+      case 'update-pacing':
+        return this.handleUpdatePacing(room, player, action.pacing, now);
+      case 'update-access':
+        return this.handleUpdateAccess(room, player, action.access, now);
       default:
         throw new ServiceError('INVALID_INPUT');
     }
@@ -904,9 +1023,21 @@ export class RoomService {
 
     if (room.status !== 'playing') throw new ServiceError('INVALID_STATE');
     // 全员离线暂停期间不接受掷骰：先重连恢复倒计时再掷
-    if (room.paused || room.deadline === null) {
+    if (room.paused) {
       throw new ServiceError('INVALID_STATE', '房间已暂停，请重新连接后再掷骰');
     }
+    // 结果展示阶段：拒绝新的掷骰；展示已到时（tick 尚未执行）先完成阶段，再让客户端同步
+    if (room.presentation !== null) {
+      if (room.presentation.until !== null && now >= room.presentation.until) {
+        if (completeResultPresentation(room, now)) {
+          if (room.status !== 'playing') room.expiresAt = now + this.roomTtlMs;
+          this.commit(room);
+        }
+        throw new ServiceError('STALE_TURN');
+      }
+      throw new ServiceError('RESULT_SHOWING');
+    }
+    if (room.deadline === null) throw new ServiceError('INVALID_STATE');
     // 到期与下一次 tick 之间迟到的请求：先把这一回合按超时结算并落盘，再让客户端同步
     if (now >= room.deadline) {
       if (skipExpiredTurn(room, now)) {
@@ -966,6 +1097,8 @@ export class RoomService {
       room.deadline = null;
       room.paused = false;
       room.pauseRemainingMs = null;
+      room.presentation = null;
+      room.presentationRemainingMs = null;
       room.turnPlayerId = null;
       room.turnId = null;
     }
@@ -1023,6 +1156,37 @@ export class RoomService {
     for (const other of activePlayers(room)) {
       if (other.id !== room.hostId) other.ready = false;
     }
+    room.lastActivityAt = now;
+    return { room: this.commit(room) };
+  }
+
+  /**
+   * 改房间节奏（结果停留秒数）：只有未离席房主可以，waiting／playing／finished 允许，closed 拒绝。
+   * 节奏从下一条记录生效：不重置准备、库存、deadline、expiresAt，也不改动正在进行的结果展示。
+   */
+  private handleUpdatePacing(room: InternalRoom, player: InternalPlayer, rawPacing: unknown, now: number): { room: RoomState } {
+    if (room.hostId !== player.id) throw new ServiceError('HOST_ONLY');
+    if (room.status === 'closed') throw new ServiceError('INVALID_STATE');
+    // 修改动作必须显式带上新配置：省略不等于“恢复默认”
+    if (rawPacing === undefined) throw new ServiceError('INVALID_INPUT');
+    const pacing = this.normalizePacingOrInvalid(rawPacing);
+    if (sameRoomPacing(room.pacing, pacing)) return { room: this.snapshot(room) };
+    room.pacing = pacing;
+    room.lastActivityAt = now;
+    return { room: this.commit(room) };
+  }
+
+  /**
+   * 改房间访问设置（大厅可见性、是否允许旁观）：只有未离席房主可以，closed 拒绝。
+   * 只改这两项：不取消其他人的准备，不改动奖品、库存、deadline 或 expiresAt。
+   * 关闭旁观由实时层在下一次广播时先发 watch-ended 再断开观众。
+   */
+  private handleUpdateAccess(room: InternalRoom, player: InternalPlayer, rawAccess: unknown, now: number): { room: RoomState } {
+    if (room.hostId !== player.id) throw new ServiceError('HOST_ONLY');
+    if (room.status === 'closed') throw new ServiceError('INVALID_STATE');
+    const access = this.normalizeAccessOrInvalid(rawAccess);
+    if (sameRoomAccess(room.access, access)) return { room: this.snapshot(room) };
+    room.access = access;
     room.lastActivityAt = now;
     return { room: this.commit(room) };
   }
@@ -1122,6 +1286,56 @@ export class RoomService {
     return this.cache.size;
   }
 
+  /**
+   * 大厅列表：遍历持久化房间目录（不能只读内存缓存），只保留公开、未过期、
+   * 状态为 waiting／playing 的房间，按 createdAt 倒序、code 升序稳定排序后分页。
+   * 请求不修改房间 lastActivityAt，也不延长任何到期时间。
+   */
+  listLobby(query: LobbyQuery): LobbyPage {
+    const now = this.nowFn();
+    const summaries: LobbyRoomSummary[] = [];
+    for (const code of this.db.listRoomCodes(now)) {
+      let room: InternalRoom | null = null;
+      try {
+        room = this.loadRoom(code);
+      } catch (error) {
+        console.error('[bobing] 大厅跳过无法解析的房间快照', code, error);
+        continue;
+      }
+      const summary = room ? this.lobbySummary(room, now) : null;
+      if (summary) summaries.push(summary);
+    }
+    summaries.sort(compareLobbyOrder);
+
+    const filtered = summaries.filter((summary) => matchesLobbyFilter(summary, query.filter));
+    const start = query.cursor === null ? 0 : indexAfterCursor(filtered, query.cursor);
+    const page = filtered.slice(start, start + query.limit);
+    const nextCursor =
+      start + page.length < filtered.length && page.length > 0 ? encodeLobbyCursor(page[page.length - 1]!) : null;
+    return { rooms: page, nextCursor };
+  }
+
+  /** 单房间摘要：不满足大厅可见条件的返回 null。 */
+  private lobbySummary(room: InternalRoom, now: number): LobbyRoomSummary | null {
+    if (room.access.visibility !== 'public') return null;
+    if (room.expiresAt !== null && room.expiresAt <= now) return null;
+    if (room.status !== 'waiting' && room.status !== 'playing') return null;
+    const players = activePlayers(room);
+    return {
+      code: room.code,
+      name: room.name,
+      status: room.status,
+      playerCount: players.length,
+      onlinePlayerCount: players.filter((player) => player.online).length,
+      maxPlayers: room.maxPlayers,
+      rulesetName: room.ruleset.name,
+      endCondition: structuredClone(room.config.endCondition),
+      canJoin: room.status === 'waiting' && players.length < room.maxPlayers,
+      allowSpectators: room.access.allowSpectators,
+      createdAt: room.createdAt,
+    };
+  }
+
   private generateRoomCode(): string {
     for (let attempt = 0; attempt < 50; attempt++) {
       const code = this.createRoomCodeFn();
@@ -1135,14 +1349,66 @@ function presenceKey(code: string, playerId: string): string {
   return `${code}:${playerId}`;
 }
 
-/** 房码忽略首尾空格并转大写；长度与字符集不合法按输入错误处理。 */
+/** createdAt 倒序、code 升序：分页顺序稳定，cursor 只表示“这一条之后”。 */
+function compareLobbyOrder(a: LobbyRoomSummary, b: LobbyRoomSummary): number {
+  if (a.createdAt !== b.createdAt) return b.createdAt - a.createdAt;
+  return a.code < b.code ? -1 : a.code > b.code ? 1 : 0;
+}
+
+function matchesLobbyFilter(summary: LobbyRoomSummary, filter: LobbyQuery['filter']): boolean {
+  if (filter === 'joinable') return summary.status === 'waiting' && summary.canJoin;
+  if (filter === 'playing') return summary.status === 'playing';
+  return true;
+}
+
+/** cursor = base64url(JSON.stringify({createdAt,code}))，只保存上一条的位置，不猜下一页。 */
+export function encodeLobbyCursor(summary: Pick<LobbyRoomSummary, 'createdAt' | 'code'>): string {
+  return Buffer.from(JSON.stringify({ createdAt: summary.createdAt, code: summary.code }), 'utf8').toString('base64url');
+}
+
+/** 解析并校验 cursor：非法（非 base64url、缺字段、房码不合法）按 INVALID_INPUT 处理。 */
+export function decodeLobbyCursor(raw: string): { createdAt: number; code: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as unknown;
+  } catch {
+    throw new ServiceError('INVALID_INPUT', 'cursor 不合法');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new ServiceError('INVALID_INPUT', 'cursor 不合法');
+  }
+  const createdAt = (parsed as { createdAt?: unknown }).createdAt;
+  const code = (parsed as { code?: unknown }).code;
+  if (typeof createdAt !== 'number' || !Number.isFinite(createdAt) || typeof code !== 'string' || !isAcceptedRoomCode(code)) {
+    throw new ServiceError('INVALID_INPUT', 'cursor 不合法');
+  }
+  return { createdAt, code };
+}
+
+/** 稳定排序列表中，位于 cursor 指向的那一条之后的第一个位置。 */
+function indexAfterCursor(summaries: readonly LobbyRoomSummary[], cursor: string): number {
+  const target = decodeLobbyCursor(cursor);
+  const index = summaries.findIndex((summary) => summary.code === target.code && summary.createdAt === target.createdAt);
+  if (index >= 0) return index + 1;
+  // cursor 那一条已经不可见（房间结束、被清理或刚改为仅邀请）：按同一排序取第一条排在它之后的房间
+  const next = summaries.findIndex((summary) => isAfterLobbyCursor(summary, target));
+  return next >= 0 ? next : summaries.length;
+}
+
+/** 在 createdAt 倒序、code 升序的排序中，`summary` 是否排在 `target` 之后。 */
+function isAfterLobbyCursor(
+  summary: Pick<LobbyRoomSummary, 'createdAt' | 'code'>,
+  target: { createdAt: number; code: string },
+): boolean {
+  if (summary.createdAt !== target.createdAt) return summary.createdAt < target.createdAt;
+  return summary.code > target.code;
+}
+
+/** 房码忽略空白并转大写；六位数字与旧六位字母数字码都接受，其余按输入错误处理。 */
 export function normalizeRoomCode(raw: unknown): string {
   if (typeof raw !== 'string') throw new ServiceError('INVALID_INPUT');
-  const code = raw.trim().toUpperCase();
-  if (code.length !== ROOM_CODE_LENGTH) throw new ServiceError('INVALID_INPUT');
-  for (const char of code) {
-    if (!ROOM_CODE_ALPHABET.includes(char)) throw new ServiceError('INVALID_INPUT');
-  }
+  const code = normalizeRoomCodeText(raw);
+  if (!isAcceptedRoomCode(code)) throw new ServiceError('INVALID_INPUT');
   return code;
 }
 

@@ -11,7 +11,15 @@
  */
 
 import { expect, test } from '@playwright/test';
-import { createRoom, joinByInvite, readInviteUrl, readMembership, startGame, toggleReady } from './helpers.js';
+import {
+  createRoom,
+  joinByInvite,
+  openMoreMenuIfNeeded,
+  readInviteUrl,
+  readMembership,
+  startGame,
+  toggleReady,
+} from './helpers.js';
 
 const STATE_ROUTE = '**/api/rooms/*/state';
 const ACTIONS_ROUTE = '**/api/rooms/*/actions';
@@ -112,6 +120,7 @@ test.describe('身份保持与离开', () => {
       await toggleReady(guest);
       await startGame(host);
       await expect(guest.getByRole('button', { name: '掷出好运' }).first()).toBeVisible({ timeout: 20_000 });
+      await openMoreMenuIfNeeded(guest);
       await guest.getByRole('button', { name: '离开房间' }).first().click();
       const dialog = guest.getByRole('dialog', { name: '离开房间？' });
       await expect(dialog).toContainText('本局已经开始的话，这一局不能再重新加入');
@@ -129,6 +138,7 @@ test.describe('身份保持与离开', () => {
       await dialog.getByRole('button', { name: '确认离开' }).click();
       await expect(guest).toHaveURL(/\/$/, { timeout: 20_000 });
       expect(await readMembership(guest, code)).toBeNull();
+      await openMoreMenuIfNeeded(host);
       await expect(host.locator('.room-meta-item', { hasText: '1/3 人' })).toBeVisible({ timeout: 20_000 });
       await expect(host.getByRole('button', { name: '掷出好运' }).first()).toBeEnabled({ timeout: 20_000 });
     } finally {

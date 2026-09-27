@@ -1,10 +1,17 @@
 /**
- * 首页：左侧品牌文案与瓷碗主视觉，右侧创建/加入表单卡片，底部三步流程与六档奖项速览。
+ * 首页：左侧品牌文案与瓷碗主视觉，右侧游戏大厅入口与创建/加入表单卡片，底部三步流程与六档奖项速览。
  * 奖项与步骤读取当前创建配置草稿与 shared 真实规则，不出现假的在线人数。
  */
 
 import { useCallback, useId, useState } from 'react';
 import type { FormEvent, ReactElement } from 'react';
+import { createDefaultRoomPacing, normalizeRoomPacing } from '../../shared/presentation.js';
+import { createDefaultRoomAccess, normalizeRoomAccess } from '../../shared/room-access.js';
+import {
+  ACCEPTED_ROOM_CODE_LENGTH,
+  isAcceptedRoomCode,
+  normalizeRoomCodeText,
+} from '../../shared/room-code.js';
 import { createDefaultRoomConfig, normalizeRoomConfig } from '../../shared/room-config.js';
 import {
   DEFAULT_MAX_PLAYERS,
@@ -16,14 +23,16 @@ import {
   PRIZE_META,
 } from '../../shared/rules.js';
 import { RULESETS } from '../../shared/rulesets.js';
-import type { RoomConfig } from '../../shared/types.js';
+import type { RoomAccess, RoomConfig, RoomPacing } from '../../shared/types.js';
 import { Bowl } from '../components/Bowl.js';
 import { RoomConfigForm } from '../components/RoomConfigForm.js';
+import { RoomSettingsFields } from '../components/RoomSettingsFields.js';
 import { SiteHeader } from '../components/SiteHeader.js';
 import { ApiError, createRoom, describeError, joinRoom, previewRoom } from '../lib/api.js';
 import { endConditionLabel, totalConfiguredPrizes } from '../lib/format.js';
-import { navigate } from '../lib/router.js';
+import { Link, navigate } from '../lib/router.js';
 import { saveMembership } from '../lib/session.js';
+import '../styles-room-settings.css';
 
 type Tab = 'create' | 'join';
 
@@ -60,16 +69,23 @@ export function Home(): ReactElement {
   const [maxPlayers, setMaxPlayers] = useState<number>(DEFAULT_MAX_PLAYERS);
   const [config, setConfig] = useState<RoomConfig>(() => createDefaultRoomConfig());
   const [configValid, setConfigValid] = useState(true);
-  const [configError, setConfigError] = useState<string | null>(null);
+
+  const [pacing, setPacing] = useState<RoomPacing>(() => createDefaultRoomPacing());
+  const [access, setAccess] = useState<RoomAccess>(() => createDefaultRoomAccess());
+  const [settingsValid, setSettingsValid] = useState(true);
 
   const [joinCode, setJoinCode] = useState('');
+  const [legacyCodeMode, setLegacyCodeMode] = useState(false);
   const [joinNickname, setJoinNickname] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const handleValidityChange = useCallback((valid: boolean, message: string | null) => {
+  const handleValidityChange = useCallback((valid: boolean) => {
     setConfigValid(valid);
-    setConfigError(message);
+  }, []);
+
+  const handleSettingsValidityChange = useCallback((valid: boolean) => {
+    setSettingsValid(valid);
   }, []);
 
   const submitCreate = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
@@ -83,13 +99,17 @@ export function Home(): ReactElement {
     if (!Number.isInteger(maxPlayers) || maxPlayers < MIN_PLAYERS || maxPlayers > MAX_PLAYERS) {
       return setError(`人数上限请填 ${MIN_PLAYERS}–${MAX_PLAYERS} 的整数`);
     }
-    if (!configValid) {
-      return setError(configError ?? '请检查房间配置与奖品数量');
+    if (!configValid || !settingsValid) {
+      return;
     }
 
     let normalizedConfig: RoomConfig;
+    let normalizedPacing: RoomPacing;
+    let normalizedAccess: RoomAccess;
     try {
       normalizedConfig = normalizeRoomConfig(config);
+      normalizedPacing = normalizeRoomPacing(pacing);
+      normalizedAccess = normalizeRoomAccess(access);
     } catch (validationError) {
       return setError(describeError(validationError));
     }
@@ -102,6 +122,8 @@ export function Home(): ReactElement {
         name: trimmedName,
         maxPlayers,
         config: normalizedConfig,
+        pacing: normalizedPacing,
+        access: normalizedAccess,
       });
       saveMembership(created.membership);
       navigate(`/room/${created.room.code}`);
@@ -115,8 +137,10 @@ export function Home(): ReactElement {
   const submitJoin = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     if (submitting) return;
-    const code = joinCode.trim().toUpperCase();
-    if (code.length !== 6) return setError('房间码是6位字母或数字，请检查后重试');
+    const code = normalizeRoomCodeText(joinCode);
+    if (!isAcceptedRoomCode(code)) {
+      return setError('房间码是6位字母或数字，请检查后重试');
+    }
     const nicknameError = validateNickname(joinNickname);
     if (nicknameError) return setError(nicknameError);
 
@@ -171,6 +195,16 @@ export function Home(): ReactElement {
 
           <section className="home-panel">
             <div className="card form-card">
+              <div className="home-lobby-bar">
+                <div className="home-lobby-copy">
+                  <span className="home-lobby-title">公开博饼桌</span>
+                  <span className="home-lobby-desc">去大厅直接入席等待中的公开桌，或旁观正在进行的牌局</span>
+                </div>
+                <Link to="/lobby" className="btn btn-secondary btn-small home-lobby-link">
+                  游戏大厅
+                </Link>
+              </div>
+
               <div className="tabs" role="tablist" aria-label="创建或加入房间">
                 <button
                   type="button"
@@ -209,7 +243,14 @@ export function Home(): ReactElement {
               ) : null}
 
               {tab === 'create' ? (
-                <form className="form" role="tabpanel" id="panel-create" aria-labelledby="tab-create" onSubmit={(event) => void submitCreate(event)}>
+                <form
+                  className="form"
+                  role="tabpanel"
+                  id="panel-create"
+                  aria-labelledby="tab-create"
+                  noValidate
+                  onSubmit={(event) => void submitCreate(event)}
+                >
                   <div className="form-field">
                     <label className="field-label" htmlFor={nicknameId}>
                       你的昵称
@@ -263,6 +304,16 @@ export function Home(): ReactElement {
                     </div>
                   </div>
 
+                  <RoomSettingsFields
+                    pacing={pacing}
+                    onPacingChange={setPacing}
+                    access={access}
+                    onAccessChange={setAccess}
+                    disabled={submitting}
+                    onValidityChange={handleSettingsValidityChange}
+                    variant="create"
+                  />
+
                   <RoomConfigForm
                     value={config}
                     onChange={setConfig}
@@ -273,7 +324,7 @@ export function Home(): ReactElement {
                   <button
                     type="submit"
                     className="btn btn-primary btn-block"
-                    disabled={submitting || !configValid}
+                    disabled={submitting || !configValid || !settingsValid}
                     aria-busy={submitting}
                   >
                     {submitting ? '正在开桌…' : '创建房间'}
@@ -281,24 +332,43 @@ export function Home(): ReactElement {
                   <p className="form-footnote">无需注册，输入昵称即可入席。</p>
                 </form>
               ) : (
-                <form className="form" role="tabpanel" id="panel-join" aria-labelledby="tab-join" onSubmit={(event) => void submitJoin(event)}>
+                <form
+                  className="form"
+                  role="tabpanel"
+                  id="panel-join"
+                  aria-labelledby="tab-join"
+                  noValidate
+                  onSubmit={(event) => void submitJoin(event)}
+                >
                   <div className="form-field">
-                    <label className="field-label" htmlFor={joinCodeId}>
-                      6位房间码
-                    </label>
+                    <div className="join-code-head">
+                      <label className="field-label" htmlFor={joinCodeId}>
+                        6位房间码
+                      </label>
+                      <button
+                        type="button"
+                        className={`code-mode-toggle ${legacyCodeMode ? 'is-active' : ''}`}
+                        aria-pressed={legacyCodeMode}
+                        onClick={() => setLegacyCodeMode((prev) => !prev)}
+                      >
+                        {legacyCodeMode ? '切换数字键盘' : '输入含字母旧码'}
+                      </button>
+                    </div>
                     <input
                       id={joinCodeId}
                       className="input input--code"
                       value={joinCode}
-                      onChange={(event) => setJoinCode(event.target.value.toUpperCase().replace(/\s+/g, '').slice(0, 6))}
-                      inputMode="text"
+                      onChange={(event) =>
+                        setJoinCode(normalizeRoomCodeText(event.target.value).slice(0, ACCEPTED_ROOM_CODE_LENGTH))
+                      }
+                      inputMode={legacyCodeMode ? 'text' : 'numeric'}
                       autoCapitalize="characters"
                       autoComplete="off"
                       spellCheck={false}
-                      placeholder="ABCD23"
+                      placeholder={legacyCodeMode ? 'ABCD23' : '028416'}
                       required
                     />
-                    <p className="field-hint">忽略大小写与首尾空格</p>
+                    <p className="field-hint">默认6位数字码（保留前导0），支持直接粘贴含字母旧房码</p>
                   </div>
 
                   <div className="form-field">

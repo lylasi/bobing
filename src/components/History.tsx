@@ -26,7 +26,7 @@ export function History({
   const records = [...history].slice(-limit).reverse();
 
   return (
-    <div className="history">
+    <section className="history" role="region" aria-label="本局完整记录">
       <div className="panel-heading">
         <h3>本局记录</h3>
         <span className="panel-meta">最近 {records.length} 条（最多保留 240 条）</span>
@@ -61,6 +61,6 @@ export function History({
         </ol>
       )}
       <p className="panel-footnote">仅显示最近 240 条记录；完整累计投掷与超时次数以玩家统计为准。</p>
-    </div>
+    </section>
   );
 }

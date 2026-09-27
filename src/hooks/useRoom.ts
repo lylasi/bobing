@@ -11,8 +11,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import type { Socket } from 'socket.io-client';
-import { SOCKET_EVENT_ROOM_STATE } from '../../shared/types.js';
-import type { Action, ErrorCode, RoomState } from '../../shared/types.js';
+import { SOCKET_EVENT_AUDIENCE, SOCKET_EVENT_ROOM_STATE } from '../../shared/types.js';
+import type { Action, AudienceState, ErrorCode, RoomState } from '../../shared/types.js';
 import { ApiError, clockOffset, fetchRoomState, sendAction, serverNow, hasServerClock } from '../lib/api.js';
 import { randomUuid } from '../lib/uuid.js';
 
@@ -44,6 +44,7 @@ export interface UseRoomResult {
   /** 重新拉取权威快照并重新订阅（用于 loadError 重试）。 */
   retry: () => void;
   connection: ConnectionState;
+  viewerCount: number;
   actionMessage: ActionMessage | null;
   clearActionMessage: () => void;
   busy: boolean;
@@ -87,6 +88,7 @@ export function useRoom(code: string, token: string): UseRoomResult {
   const [loadError, setLoadError] = useState<ApiError | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [connection, setConnection] = useState<ConnectionState>('connecting');
+  const [viewerCount, setViewerCount] = useState(0);
   const [actionMessage, setActionMessage] = useState<ActionMessage | null>(null);
   const [busy, setBusy] = useState(false);
   const [rollPending, setRollPending] = useState(false);
@@ -136,6 +138,7 @@ export function useRoom(code: string, token: string): UseRoomResult {
     setFatal(null);
     setLoadError(null);
     setActionMessage(null);
+    setViewerCount(0);
     setLoading(true);
     setConnection('connecting');
 
@@ -173,6 +176,11 @@ export function useRoom(code: string, token: string): UseRoomResult {
       });
 
       socket.on(SOCKET_EVENT_ROOM_STATE, (snapshot: RoomState) => merge(snapshot));
+      socket.on(SOCKET_EVENT_AUDIENCE, (payload: AudienceState) => {
+        if (payload && payload.roomCode === code && typeof payload.viewerCount === 'number') {
+          setViewerCount(Math.max(0, payload.viewerCount));
+        }
+      });
     };
 
     void (async () => {
@@ -226,7 +234,7 @@ export function useRoom(code: string, token: string): UseRoomResult {
       } catch (error) {
         const apiError = toApiError(error);
         rollAttemptRef.current = null;
-        if (action.type !== 'update-config') {
+        if (action.type !== 'update-config' && action.type !== 'update-pacing' && action.type !== 'update-access') {
           setActionMessage({ code: apiError.code, text: apiError.message });
         }
         try {
@@ -291,6 +299,7 @@ export function useRoom(code: string, token: string): UseRoomResult {
       loadError,
       retry,
       connection,
+      viewerCount,
       actionMessage,
       clearActionMessage,
       busy,
@@ -302,6 +311,6 @@ export function useRoom(code: string, token: string): UseRoomResult {
       runAction,
       roll,
     }),
-    [room, playerId, loading, fatal, loadError, retry, connection, actionMessage, clearActionMessage, busy, rollPending, now, refresh, runAction, roll],
+    [room, playerId, loading, fatal, loadError, retry, connection, viewerCount, actionMessage, clearActionMessage, busy, rollPending, now, refresh, runAction, roll],
   );
 }

@@ -1,0 +1,772 @@
+/* ==========================================================================
+   房间设置、首页大厅入口、数字房码输入与单层六档奖品配置样式
+   （由 Home / RoomConfigForm / RoomSettingsFields / RoomSettingsDialog 引入）
+   ========================================================================== */
+
+/* ---------- 首页：游戏大厅入口条 ---------- */
+
+.page--home .home-lobby-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: linear-gradient(90deg, rgba(249, 239, 224, 0.85), rgba(255, 253, 249, 0.95));
+}
+
+.page--home .home-lobby-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.page--home .home-lobby-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.page--home .home-lobby-desc {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.page--home .home-lobby-link {
+  flex: none;
+  min-height: 44px;
+  padding: 0 16px;
+  border-radius: 999px;
+  border: 1px solid var(--red);
+  background: var(--surface);
+  color: var(--red-active);
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+.page--home .home-lobby-link:hover {
+  background: var(--gold-light);
+  color: var(--red);
+}
+
+/* ---------- 首页：6位数字码与旧字母房码键盘切换 ---------- */
+
+.page--home .join-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.page--home .code-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.page--home .code-mode-toggle:hover {
+  border-color: var(--red);
+  background: var(--gold-light);
+  color: var(--red-active);
+}
+
+.page--home .code-mode-toggle.is-active {
+  border-color: var(--red);
+  background: var(--gold-light);
+  color: var(--red-active);
+  font-weight: 600;
+}
+
+/* ---------- 可复用房间设置字段（RoomSettingsFields） ---------- */
+
+.room-settings-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(251, 246, 238, 0.55);
+}
+
+.room-settings-fields--dialog {
+  background: var(--surface);
+  padding: 12px 14px;
+  gap: 12px;
+}
+
+.room-settings-fields .settings-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.room-settings-fields .settings-section-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.room-settings-fields .settings-visibility-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.room-settings-fields .settings-radio-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.room-settings-fields .settings-grid-row {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 8px;
+  align-items: stretch;
+}
+
+.room-settings-fields .settings-check-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.room-settings-fields .settings-check-card.is-active {
+  border-color: var(--red);
+  background: var(--gold-light);
+}
+
+.room-settings-fields .settings-check-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.room-settings-fields .settings-check-head input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--red);
+  margin: 0;
+  flex: none;
+}
+
+.room-settings-fields .settings-check-desc {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.room-settings-fields .settings-hold-box {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  min-width: 0;
+}
+
+.room-settings-fields .settings-hold-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.room-settings-fields .settings-hold-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.room-settings-fields .settings-hold-input-group,
+.room-settings-fields .settings-hold-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.room-settings-fields .settings-hold-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-numeric);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    opacity 0.15s ease;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.room-settings-fields .settings-hold-step:hover:not(:disabled) {
+  border-color: var(--red);
+  background: var(--gold-light);
+  color: var(--red-active);
+}
+
+.room-settings-fields .settings-hold-step:active:not(:disabled) {
+  background: rgba(200, 62, 49, 0.12);
+  border-color: var(--red);
+}
+
+.room-settings-fields .settings-hold-step:focus {
+  outline: none;
+}
+
+.room-settings-fields .settings-hold-step:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+}
+
+.room-settings-fields .settings-hold-step:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  background: var(--surface-muted);
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+
+.room-settings-fields .settings-hold-input::-webkit-outer-spin-button,
+.room-settings-fields .settings-hold-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.room-settings-fields .settings-hold-input {
+  -moz-appearance: textfield;
+  appearance: textfield;
+  width: 42px;
+  min-height: 44px;
+  height: 44px;
+  padding: 0 2px;
+  text-align: center;
+  font-family: var(--font-numeric);
+  font-size: 16px;
+  font-weight: 700;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  box-sizing: border-box;
+}
+
+.room-settings-fields .settings-hold-input:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+  border-color: var(--red);
+}
+
+.room-settings-fields .settings-hold-unit {
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.room-settings-fields .settings-hold-hint {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.room-settings-fields .settings-field-error {
+  margin-top: 2px;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+/* ---------- 房间设置弹层（RoomSettingsDialog） ---------- */
+
+.room-settings-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.room-settings-dialog-notice {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+}
+
+/* ---------- 单层六档奖品表与独立收起个人方案（RoomConfigForm） ---------- */
+
+.room-config-form .config-fieldset {
+  background: transparent;
+  padding: 8px 10px;
+}
+
+.room-config-form .config-advanced-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  gap: 10px;
+}
+
+.room-config-form .config-prizes-section {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.room-config-form .config-prizes-head-row {
+  display: grid;
+  grid-template-columns: minmax(148px, 1.15fr) 92px minmax(0, 1.85fr);
+  gap: 10px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.room-config-form .config-prizes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.room-config-form .config-prize-item {
+  display: grid;
+  grid-template-columns: minmax(148px, 1.15fr) 92px minmax(0, 1.85fr);
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: none;
+  border-bottom: 1px solid rgba(226, 211, 188, 0.65);
+  border-radius: 0;
+  background: var(--surface);
+}
+
+.room-config-form .config-prize-item:last-child {
+  border-bottom: none;
+}
+
+.room-config-form .config-prize-item--champion {
+  background: linear-gradient(90deg, rgba(249, 239, 224, 0.55), rgba(255, 253, 249, 0.95));
+}
+
+.room-config-form .config-prize-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.room-config-form .config-prize-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.room-config-form .config-prize-name {
+  font-family: var(--font-title);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.room-config-form .config-prize-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(200, 62, 49, 0.12);
+  color: var(--red-active);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.room-config-form .config-prize-desc {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--text-secondary);
+  text-align: left;
+  white-space: normal;
+  overflow: visible;
+}
+
+.room-config-form .config-prize-count-wrap,
+.room-config-form .config-prize-content-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* 桌面端已有三列表头（奖级 / 数量 / 奖品内容），行内标签隐藏为无障碍可读 */
+.room-config-form .config-inline-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.room-config-form .config-count-input,
+.room-config-form .config-content-input {
+  min-height: 42px;
+  padding: 0 10px;
+  font-size: 15px;
+}
+
+.room-config-form .config-templates-collapsible {
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.room-config-form .config-templates-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.room-config-form .config-templates-bar-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.room-config-form .config-templates-panel {
+  border: none;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(251, 246, 238, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.room-config-form .config-templates-panel[hidden] {
+  display: none !important;
+}
+
+/* ---------- 手机端（≤600px）：每档两行（第1行奖级，第2行数量+内容）及首屏高度收敛 ---------- */
+
+@media (max-width: 600px) {
+  .page--home .home-grid {
+    padding: 8px 0;
+    gap: 10px;
+  }
+
+  .page--home .home-subtitle {
+    margin-top: 4px;
+    font-size: 15px;
+  }
+
+  .page--home .home-points {
+    margin-top: 6px;
+    gap: 2px;
+    font-size: 13px;
+  }
+
+  .page--home .home-visual {
+    margin-top: 8px;
+  }
+
+  .page--home .bowl-wrap--hero {
+    max-width: 200px;
+  }
+
+  .page--home .form-card {
+    padding: 14px;
+  }
+
+  .page--home .tabs {
+    margin-bottom: 8px;
+  }
+
+  .page--home .form {
+    gap: 8px;
+  }
+
+  .page--home .home-lobby-bar {
+    padding: 6px 10px;
+    margin-bottom: 8px;
+    gap: 8px;
+  }
+
+  .page--home .home-lobby-desc {
+    display: none;
+  }
+
+  .room-settings-fields {
+    padding: 6px 8px;
+    gap: 6px;
+  }
+
+  .room-settings-fields .settings-section-note {
+    display: none;
+  }
+
+  .room-settings-fields .settings-radio-grid .config-radio-desc,
+  .room-settings-fields .settings-check-desc {
+    display: none;
+  }
+
+  .room-settings-fields .settings-grid-row {
+    grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
+    gap: 6px;
+  }
+
+  .room-settings-fields .settings-check-card {
+    padding: 5px 8px;
+  }
+
+  .room-settings-fields .settings-check-head {
+    gap: 6px;
+  }
+
+  .room-settings-fields .settings-hold-box {
+    padding: 5px 8px;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .room-settings-fields .settings-hold-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .room-settings-fields .settings-hold-label {
+    font-size: 12px;
+    min-width: 0;
+  }
+
+  .room-settings-fields .settings-hold-input-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: none;
+  }
+
+  .room-settings-fields .settings-hold-input {
+    width: 38px;
+    min-height: 44px;
+    height: 44px;
+    padding: 0 2px;
+    font-size: 15px;
+  }
+
+  .room-settings-fields .settings-hold-unit {
+    font-size: 12px;
+    flex: none;
+  }
+
+  .room-settings-fields .settings-hold-hint {
+    font-size: 11px;
+    line-height: 1.2;
+  }
+
+  .room-config-form {
+    gap: 6px;
+  }
+
+  .room-config-form .config-fieldset {
+    padding: 5px 8px;
+    gap: 4px;
+  }
+
+  .room-config-form .config-radio-card {
+    padding: 5px 8px;
+  }
+
+  .room-config-form .config-advanced-box {
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  .room-config-form .config-prizes-head-row {
+    display: none;
+  }
+
+  .room-config-form .config-prize-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'tier count'
+      'content content';
+    gap: 6px 8px;
+    align-items: center;
+    padding: 8px 10px;
+  }
+
+  .room-config-form .config-prize-header {
+    grid-area: tier;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .room-config-form .config-prize-title-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .room-config-form .config-prize-name {
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+
+  .room-config-form .config-prize-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    line-height: 1.3;
+  }
+
+  .room-config-form .config-prize-desc {
+    font-size: 11px;
+    line-height: 1.25;
+    color: var(--text-secondary);
+    display: block;
+  }
+
+  .room-config-form .config-prize-count-wrap {
+    grid-area: count;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    flex: none;
+  }
+
+  .room-config-form .config-count-input {
+    width: 58px;
+    min-height: 42px;
+    text-align: center;
+    padding: 0 4px;
+    font-size: 15px;
+  }
+
+  .room-config-form .config-prize-content-wrap {
+    grid-area: content;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .room-config-form .config-content-input {
+    width: 100%;
+    min-height: 42px;
+    padding: 0 10px;
+    font-size: 14px;
+  }
+
+  .room-config-form .config-inline-label {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip: auto;
+    white-space: nowrap;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+}
+
+/* 360px 及以下超窄屏（如 320px）：设置卡两列折行，彻底避免秒字被挤出 */
+@media (max-width: 360px) {
+  .room-settings-fields .settings-grid-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+}

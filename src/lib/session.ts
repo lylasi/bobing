@@ -8,8 +8,10 @@
  */
 
 import type { Membership } from '../../shared/types.js';
+import { randomUuid } from './uuid.js';
 
 const KEY_PREFIX = 'bobing.membership.';
+const VIEWER_KEY_PREFIX = 'bobing.viewer.';
 
 function storage(): Storage | null {
   try {
@@ -95,4 +97,41 @@ export function clearMembership(code: string): void {
       // 忽略：内存回退已经清理
     }
   }
+}
+
+const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * 旁观访客标识（按房间独立保存，仅用于同浏览器多标签去重计数，绝不具备任何成员权限）。
+ * 使用独立键 `bobing.viewer.<CODE>`，不占用也不覆盖成员凭证存储。
+ */
+export function getOrCreateViewerId(code: string): string {
+  const normalized = code.trim().toUpperCase();
+  const key = `${VIEWER_KEY_PREFIX}${normalized}`;
+  const store = storage();
+  let existing: string | null = null;
+  if (store) {
+    try {
+      existing = store.getItem(key);
+    } catch {
+      existing = null;
+    }
+  }
+  if (!existing) {
+    existing = memoryFallback.get(key) ?? null;
+  }
+  if (existing && UUID_V4_REGEX.test(existing)) {
+    return existing;
+  }
+  const created = randomUuid();
+  if (store) {
+    try {
+      store.setItem(key, created);
+      return created;
+    } catch {
+      // 配额或隐私限制：退化为内存保存
+    }
+  }
+  memoryFallback.set(key, created);
+  return created;
 }

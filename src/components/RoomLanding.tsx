@@ -137,6 +137,10 @@ export function RoomLanding({ code, notice, onJoined }: RoomLandingProps): React
                 <dt>系统房规</dt>
                 <dd>{preview.ruleset.name}</dd>
               </div>
+              <div>
+                <dt>结果停留</dt>
+                <dd>{preview.pacing?.resultHoldSeconds ?? 1} 秒</dd>
+              </div>
             </dl>
 
             <div className="landing-prizes">
@@ -163,8 +167,23 @@ export function RoomLanding({ code, notice, onJoined }: RoomLandingProps): React
                   {blocked}
                 </p>
                 <div className="landing-actions">
-                  <Link className="btn btn-primary" to="/">
+                  {preview.access?.allowSpectators && preview.status !== 'closed' ? (
+                    <Link className="btn btn-primary" to={`/room/${preview.code}/watch`}>
+                      旁观
+                    </Link>
+                  ) : null}
+                  <Link
+                    className={
+                      preview.access?.allowSpectators && preview.status !== 'closed'
+                        ? 'btn btn-secondary'
+                        : 'btn btn-primary'
+                    }
+                    to="/"
+                  >
                     回首页
+                  </Link>
+                  <Link className="btn btn-secondary" to="/lobby">
+                    去游戏大厅
                   </Link>
                 </div>
               </>
@@ -194,6 +213,11 @@ export function RoomLanding({ code, notice, onJoined }: RoomLandingProps): React
                 <button type="submit" className="btn btn-primary btn-block" disabled={submitting} aria-busy={submitting}>
                   {submitting ? '正在入席…' : '加入房间'}
                 </button>
+                {preview.access?.allowSpectators ? (
+                  <Link className="btn btn-secondary btn-block landing-watch-btn" to={`/room/${preview.code}/watch`}>
+                    先看看
+                  </Link>
+                ) : null}
                 <p className="form-footnote">无需注册，输入昵称即可入席。</p>
               </form>
             )}
